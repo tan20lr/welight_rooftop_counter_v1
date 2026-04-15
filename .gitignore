@@ -1,0 +1,6 @@
+.tile_cache_google/
+outputs/
+__pycache__/
+*.pyc
+.env
+*.tmp
