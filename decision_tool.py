@@ -47,86 +47,122 @@ for k in ("result",):
 # ── Charte graphique WeLight ───────────────────────────────────────────────────
 st.markdown("""
 <style>
-  /* Fonts & base */
-  html, body, [class*="css"] { font-family: 'Inter', 'Segoe UI', Arial, sans-serif; }
+  /* ── Typographie de base ── */
+  html, body, [class*="css"] {
+    font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
+  }
 
-  /* Sidebar */
-  [data-testid="stSidebar"] { background: #1A1A1A !important; }
-  [data-testid="stSidebar"] * { color: #F0F0F0 !important; }
-  [data-testid="stSidebar"] .stSlider > div > div { background: #FFC500 !important; }
-  [data-testid="stSidebar"] h1,
+  /* ── Sidebar : titres de section en jaune WeLight, fond par défaut ── */
   [data-testid="stSidebar"] h2,
-  [data-testid="stSidebar"] h3 { color: #FFC500 !important; border-bottom: 1px solid #333; padding-bottom: 4px; }
+  [data-testid="stSidebar"] h3 {
+    color: #B38600 !important;
+    font-weight: 700;
+    border-bottom: 2px solid #FFC500;
+    padding-bottom: 3px;
+    margin-top: 1.2rem !important;
+  }
+  [data-testid="stSidebar"] small,
+  [data-testid="stSidebar"] .stCaption { color: #555 !important; }
 
-  /* Header */
+  /* ── En-tête ── */
   .wl-header {
     background: #1A1A1A;
-    padding: 1.2rem 1.8rem;
+    padding: 1.1rem 1.6rem;
     border-radius: 10px;
     margin-bottom: 1.2rem;
     display: flex;
     align-items: center;
-    gap: 1rem;
+    gap: 1.2rem;
   }
-  .wl-logo-text {
-    font-size: 1.7rem;
-    font-weight: 900;
-    color: #FFC500;
-    letter-spacing: -0.5px;
-  }
-  .wl-logo-sub {
-    font-size: .85rem;
-    color: #AAAAAA;
-    margin-top: .1rem;
-  }
+  .wl-logo-sun  { font-size: 2.2rem; line-height: 1; }
+  .wl-logo-text { font-size: 1.6rem; font-weight: 900; color: #FFC500; letter-spacing: -.5px; }
+  .wl-logo-sub  { font-size: .82rem; color: #AAAAAA; margin-top: .15rem; }
   .wl-badge {
     display: inline-block;
     background: #FFC500;
     color: #1A1A1A;
-    font-size: .68rem;
+    font-size: .67rem;
     font-weight: 800;
-    padding: 2px 10px;
+    padding: 3px 10px;
     border-radius: 20px;
     margin-right: 5px;
     text-transform: uppercase;
-    letter-spacing: .3px;
+    letter-spacing: .4px;
   }
 
-  /* Verdict cards */
+  /* ── Cartes de verdict — fond clair, texte foncé, lisible ── */
   .verdict-invest {
-    background: linear-gradient(135deg, #1A1A1A 0%, #2A2A2A 100%);
+    background: #FFFBEA;
     border-left: 6px solid #FFC500;
-    padding: 1.2rem 1.8rem;
     border-radius: 10px;
-    margin: 1rem 0;
+    padding: 1.1rem 1.6rem;
+    margin: .8rem 0;
   }
   .verdict-evaluate {
-    background: linear-gradient(135deg, #2A2200 0%, #3A3000 100%);
-    border-left: 6px solid #FFC500;
-    padding: 1.2rem 1.8rem;
+    background: #FFF8E1;
+    border-left: 6px solid #FF8F00;
     border-radius: 10px;
-    margin: 1rem 0;
+    padding: 1.1rem 1.6rem;
+    margin: .8rem 0;
   }
   .verdict-no {
-    background: #1A1A1A;
-    border-left: 6px solid #555;
-    padding: 1.2rem 1.8rem;
+    background: #FFF3F3;
+    border-left: 6px solid #D32F2F;
     border-radius: 10px;
-    margin: 1rem 0;
+    padding: 1.1rem 1.6rem;
+    margin: .8rem 0;
   }
-  .verdict-icon { font-size: 1.5rem; margin-right: .5rem; }
-  .verdict-title { font-size: 1.35rem; font-weight: 900; color: #FFC500; }
-  .verdict-sub   { font-size: .9rem; color: #CCCCCC; margin-top: .3rem; }
+  .verdict-title {
+    font-size: 1.25rem;
+    font-weight: 900;
+    color: #1A1A1A;
+  }
+  .verdict-sub {
+    font-size: .88rem;
+    color: #444444;
+    margin-top: .3rem;
+  }
 
-  /* Metric override */
+  /* ── Barre de score ── */
+  .score-bar-bg {
+    background: #E0E0E0;
+    border-radius: 6px;
+    height: 10px;
+    margin: 6px 0 14px;
+  }
+  .score-bar-fill {
+    background: #FFC500;
+    border-radius: 6px;
+    height: 10px;
+  }
+
+  /* ── Boîtes info / alerte ── */
+  .info-box {
+    background: #FFFDE7;
+    border: 1px solid #FFC500;
+    border-radius: 8px;
+    padding: .65rem 1rem;
+    font-size: .84rem;
+    color: #333;
+    margin: .5rem 0;
+  }
+  .warn-box {
+    background: #FFF3E0;
+    border: 1px solid #FF8F00;
+    border-radius: 8px;
+    padding: .65rem 1rem;
+    font-size: .84rem;
+    color: #333;
+    margin: .5rem 0;
+  }
+
+  /* ── Métriques ── */
   [data-testid="metric-container"] {
-    background: #F8F8F8;
+    background: #FAFAFA;
     border: 1px solid #E8E8E8;
     border-radius: 8px;
-    padding: .7rem 1rem;
+    padding: .65rem 1rem;
   }
-  [data-testid="metric-container"] label { color: #555 !important; font-size: .78rem !important; }
-  [data-testid="metric-container"] [data-testid="stMetricValue"] { color: #1A1A1A !important; font-weight: 800 !important; }
 
   /* Score bar */
   .score-bar-bg {
@@ -166,11 +202,12 @@ st.markdown("""
 # ── En-tête ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="wl-header">
+  <div class="wl-logo-sun">&#9728;</div>
   <div>
-    <div class="wl-logo-text">&#9728; WeLight Africa</div>
+    <div class="wl-logo-text">WeLight Africa</div>
     <div class="wl-logo-sub">Outil d'aide à la décision — Mini-réseaux solaires Madagascar</div>
   </div>
-  <div style="margin-left:auto">
+  <div style="margin-left:auto; text-align:right">
     <span class="wl-badge">Google Open Buildings v3</span>
     <span class="wl-badge">NASA POWER GHI</span>
     <span class="wl-badge">172 villages opérés</span>
@@ -597,12 +634,11 @@ if res:
                 vcls  = "verdict-no"
                 vicon = "❌"
                 vtit  = "NE PAS INVESTIR"
-                vsub  = f"Remboursement trop long ({pb} ans) ou score insuffisant ({total_sc}/80) dans les conditions actuelles."
+                vsub  = f"Remboursement trop long ({pb} ans) ou score insuffisant ({total_sc}/80) avec les paramètres actuels."
 
             st.markdown(f"""
             <div class="{vcls}">
-              <span class="verdict-icon">{vicon}</span>
-              <span class="verdict-title">{name.upper()} — {vtit}</span>
+              <div class="verdict-title">{vicon}&nbsp; {name.upper()} — {vtit}</div>
               <div class="verdict-sub">{vsub}</div>
             </div>""", unsafe_allow_html=True)
 
