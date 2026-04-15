@@ -1,11 +1,10 @@
 """
-WeLight Africa — Village Solar Decision Tool
-Combines rooftop detection, solar resource, grid distance and financial modelling
-into a single investment decision dashboard.
+WeLight Africa — Outil d'Aide à la Décision Solaire
+Analyse un village malgache : toits, ressource solaire, réseau, modèle financier.
 """
 
 import streamlit as st
-import requests, gzip, csv, math, os, s2sphere, folium
+import requests, gzip, csv, math, os, s2sphere, folium, pandas as pd
 from streamlit_folium import st_folium
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -14,9 +13,10 @@ GOB_BASE       = "https://storage.googleapis.com/open-buildings-data/v3/points_s
 NOMINATIM_URL  = "https://nominatim.openstreetmap.org/search"
 NASA_POWER_URL = "https://power.larc.nasa.gov/api/temporal/climatology/point"
 SNAPSHOT_RADII = [1.0, 2.0, 5.0]
-SME_AREA_M2    = 150   # buildings >= this area classified as commercial/SME
+MIN_CONFIDENCE = 0.6    # Seuil validé sur terrain nord Madagascar — non modifiable
+SME_AREA_M2    = 150    # Bâtiments >= 150 m² classifiés PME/commerces
 
-# JIRAMA electrified towns in northern Madagascar (lat, lon, name)
+# Villes électrifiées JIRAMA — nord et côte est Madagascar
 JIRAMA_TOWNS = [
     (-12.3547, 49.2967, "Antsiranana"),
     (-13.1944, 49.0499, "Ambilobe"),
@@ -35,7 +35,7 @@ JIRAMA_TOWNS = [
 os.makedirs(TILE_CACHE_DIR, exist_ok=True)
 
 st.set_page_config(
-    page_title="WeLight — Solar Decision Tool",
+    page_title="WeLight — Outil Décisionnel Solaire",
     page_icon="☀️",
     layout="wide",
 )
@@ -44,7 +44,141 @@ for k in ("result",):
     if k not in st.session_state:
         st.session_state[k] = None
 
-# ── S2 / GOB helpers ───────────────────────────────────────────────────────────
+# ── Charte graphique WeLight ───────────────────────────────────────────────────
+st.markdown("""
+<style>
+  /* Fonts & base */
+  html, body, [class*="css"] { font-family: 'Inter', 'Segoe UI', Arial, sans-serif; }
+
+  /* Sidebar */
+  [data-testid="stSidebar"] { background: #1A1A1A !important; }
+  [data-testid="stSidebar"] * { color: #F0F0F0 !important; }
+  [data-testid="stSidebar"] .stSlider > div > div { background: #FFC500 !important; }
+  [data-testid="stSidebar"] h1,
+  [data-testid="stSidebar"] h2,
+  [data-testid="stSidebar"] h3 { color: #FFC500 !important; border-bottom: 1px solid #333; padding-bottom: 4px; }
+
+  /* Header */
+  .wl-header {
+    background: #1A1A1A;
+    padding: 1.2rem 1.8rem;
+    border-radius: 10px;
+    margin-bottom: 1.2rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+  .wl-logo-text {
+    font-size: 1.7rem;
+    font-weight: 900;
+    color: #FFC500;
+    letter-spacing: -0.5px;
+  }
+  .wl-logo-sub {
+    font-size: .85rem;
+    color: #AAAAAA;
+    margin-top: .1rem;
+  }
+  .wl-badge {
+    display: inline-block;
+    background: #FFC500;
+    color: #1A1A1A;
+    font-size: .68rem;
+    font-weight: 800;
+    padding: 2px 10px;
+    border-radius: 20px;
+    margin-right: 5px;
+    text-transform: uppercase;
+    letter-spacing: .3px;
+  }
+
+  /* Verdict cards */
+  .verdict-invest {
+    background: linear-gradient(135deg, #1A1A1A 0%, #2A2A2A 100%);
+    border-left: 6px solid #FFC500;
+    padding: 1.2rem 1.8rem;
+    border-radius: 10px;
+    margin: 1rem 0;
+  }
+  .verdict-evaluate {
+    background: linear-gradient(135deg, #2A2200 0%, #3A3000 100%);
+    border-left: 6px solid #FFC500;
+    padding: 1.2rem 1.8rem;
+    border-radius: 10px;
+    margin: 1rem 0;
+  }
+  .verdict-no {
+    background: #1A1A1A;
+    border-left: 6px solid #555;
+    padding: 1.2rem 1.8rem;
+    border-radius: 10px;
+    margin: 1rem 0;
+  }
+  .verdict-icon { font-size: 1.5rem; margin-right: .5rem; }
+  .verdict-title { font-size: 1.35rem; font-weight: 900; color: #FFC500; }
+  .verdict-sub   { font-size: .9rem; color: #CCCCCC; margin-top: .3rem; }
+
+  /* Metric override */
+  [data-testid="metric-container"] {
+    background: #F8F8F8;
+    border: 1px solid #E8E8E8;
+    border-radius: 8px;
+    padding: .7rem 1rem;
+  }
+  [data-testid="metric-container"] label { color: #555 !important; font-size: .78rem !important; }
+  [data-testid="metric-container"] [data-testid="stMetricValue"] { color: #1A1A1A !important; font-weight: 800 !important; }
+
+  /* Score bar */
+  .score-bar-bg {
+    background: #E8E8E8;
+    border-radius: 6px;
+    height: 10px;
+    margin: 4px 0 12px;
+  }
+  .score-bar-fill {
+    background: #FFC500;
+    border-radius: 6px;
+    height: 10px;
+  }
+
+  /* Info boxes */
+  .info-box {
+    background: #FFFBEA;
+    border: 1px solid #FFC500;
+    border-radius: 8px;
+    padding: .7rem 1rem;
+    font-size: .85rem;
+    color: #333;
+    margin: .5rem 0;
+  }
+  .warn-box {
+    background: #FFF3E0;
+    border: 1px solid #FB8C00;
+    border-radius: 8px;
+    padding: .7rem 1rem;
+    font-size: .85rem;
+    color: #333;
+    margin: .5rem 0;
+  }
+</style>
+""", unsafe_allow_html=True)
+
+# ── En-tête ────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="wl-header">
+  <div>
+    <div class="wl-logo-text">&#9728; WeLight Africa</div>
+    <div class="wl-logo-sub">Outil d'aide à la décision — Mini-réseaux solaires Madagascar</div>
+  </div>
+  <div style="margin-left:auto">
+    <span class="wl-badge">Google Open Buildings v3</span>
+    <span class="wl-badge">NASA POWER GHI</span>
+    <span class="wl-badge">172 villages opérés</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Fonctions S2 / GOB ─────────────────────────────────────────────────────────
 
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371.0
@@ -89,39 +223,35 @@ def download_tile(token):
         for chunk in r.iter_content(65536): f.write(chunk)
     if not _is_valid_gz(tmp):
         os.remove(tmp)
-        raise IOError(f"Tile {token} corrupted — please retry.")
+        raise IOError(f"Tuile {token} corrompue — réessayez.")
     os.replace(tmp, path)
     return path
 
-def count_buildings_detailed(lat, lon, tile_paths, radii, min_conf=0.6, sme_threshold=SME_AREA_M2):
-    """Returns per-radius counts split into residential vs SME/commercial."""
+def count_buildings_detailed(lat, lon, tile_paths, radii, sme_threshold=SME_AREA_M2):
     max_r = max(radii); BB = max_r / 111.0 * 1.3
     candidates = []
     for path in tile_paths:
         with gzip.open(path, "rt", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 try:
-                    if float(row.get("confidence", 1)) < min_conf: continue
+                    if float(row.get("confidence", 1)) < MIN_CONFIDENCE: continue
                     blat = float(row["latitude"]); blon = float(row["longitude"])
                     if abs(blat - lat) > BB or abs(blon - lon) > BB: continue
                     d = haversine(lat, lon, blat, blon)
                     if d > max_r: continue
                     area = float(row.get("area_in_meters", 0) or 0)
-                    is_sme = area >= sme_threshold
-                    candidates.append((d, blat, blon, area, is_sme))
+                    candidates.append((d, blat, blon, area, area >= sme_threshold))
                 except Exception:
                     pass
     result = {}
     for r in radii:
         in_r = [c for c in candidates if c[0] <= r]
-        residential = [(c[1], c[2]) for c in in_r if not c[4]]
-        sme         = [(c[1], c[2]) for c in in_r if c[4]]
         result[r] = {
-            "total":       len(in_r),
-            "residential": len(residential),
-            "sme":         len(sme),
-            "res_coords":  residential,
-            "sme_coords":  sme,
+            "total":      len(in_r),
+            "residential": len([c for c in in_r if not c[4]]),
+            "sme":         len([c for c in in_r if c[4]]),
+            "res_coords":  [(c[1], c[2]) for c in in_r if not c[4]],
+            "sme_coords":  [(c[1], c[2]) for c in in_r if c[4]],
         }
     return result
 
@@ -132,7 +262,7 @@ def geocode(name):
         r = requests.get(NOMINATIM_URL,
                          params={"q": f"{name}, Madagascar", "format": "json",
                                  "limit": 8, "addressdetails": 1},
-                         headers={"User-Agent": "WeLight-DecisionTool/1.0"},
+                         headers={"User-Agent": "WeLight-DecisionTool/2.0"},
                          timeout=10)
         results = r.json()
     except Exception:
@@ -142,7 +272,6 @@ def geocode(name):
 
 @st.cache_data(show_spinner=False)
 def get_ghi(lat, lon):
-    """Returns (ghi_annual, ghi_monthly[12]) from NASA POWER. Falls back to 5.5."""
     try:
         r = requests.get(
             NASA_POWER_URL,
@@ -162,13 +291,12 @@ def get_ghi(lat, lon):
             else:
                 monthly.append(None)
         if ann <= 0 and any(v for v in monthly if v):
-            ann = sum(v for v in monthly if v) / sum(1 for v in monthly if v)
-        return ann if ann > 0 else 5.5, monthly
+            ann = sum(v for v in monthly if v) / len([v for v in monthly if v])
+        return (ann if ann > 0 else 5.5), monthly
     except Exception:
         return 5.5, [None] * 12
 
 def get_grid_distance(lat, lon):
-    """Returns (distance_km, nearest_town) from hardcoded JIRAMA list."""
     best_d, best_name = None, None
     for tlat, tlon, tname in JIRAMA_TOWNS:
         d = haversine(lat, lon, tlat, tlon)
@@ -176,97 +304,67 @@ def get_grid_distance(lat, lon):
             best_d, best_name = d, tname
     return round(best_d, 1), best_name
 
-def compute_financials(n_residential, n_sme, ghi_annual, cfg):
-    """
-    Returns a dict with sizing, revenue and payback for the given parameters.
-    """
-    pen_r   = cfg["penetration_residential"]
-    pen_s   = cfg["penetration_sme"]
-    tar_r   = cfg["tariff_residential_eur"]
-    tar_s   = cfg["tariff_sme_eur"]
-    cpkwp   = cfg["capex_per_kwp_eur"]
-    kwh_r   = cfg["kwh_per_hh_day"]
-    kwh_s   = cfg["kwh_per_sme_day"]
-    eff     = cfg["system_efficiency"]
-    batt    = cfg["battery_autonomy_days"]
-    opex_p  = cfg["opex_pct_capex"]
-    dr      = cfg["discount_rate"]
-    life    = cfg["project_lifetime_years"]
-
-    sub_r = round(n_residential * pen_r)
-    sub_s = round(n_sme        * pen_s)
-
-    daily_kwh = sub_r * kwh_r + sub_s * kwh_s
-    if daily_kwh <= 0 or ghi_annual <= 0:
+def compute_financials(n_res, n_sme, ghi, cfg):
+    sub_r = round(n_res * cfg["pen_r"])
+    sub_s = round(n_sme * cfg["pen_s"])
+    daily_kwh = sub_r * cfg["kwh_r"] + sub_s * cfg["kwh_s"]
+    if daily_kwh <= 0 or ghi <= 0:
         return None
-
-    peak_kwp  = daily_kwh / (ghi_annual * eff)
-    batt_kwh  = daily_kwh * batt
-    capex     = peak_kwp * cpkwp + batt_kwh * 150   # EUR 150/kWh storage
-
-    ann_rev   = (sub_r * tar_r + sub_s * tar_s) * 12
-    opex      = capex * opex_p
-    net_ann   = ann_rev - opex
-
-    payback   = capex / net_ann if net_ann > 0 else 999
-
-    # NPV
-    npv = -capex + sum(net_ann / (1 + dr) ** t for t in range(1, life + 1))
-
-    # IRR (Newton-Raphson)
+    peak_kwp = daily_kwh / (ghi * cfg["eff"])
+    batt_kwh = daily_kwh * cfg["batt"]
+    capex    = peak_kwp * cfg["cpkwp"] + batt_kwh * 150
+    ann_rev  = (sub_r * cfg["tar_r"] + sub_s * cfg["tar_s"]) * 12
+    opex     = capex * cfg["opex_p"]
+    net_ann  = ann_rev - opex
+    payback  = capex / net_ann if net_ann > 0 else 999
+    npv = -capex + sum(net_ann / (1 + cfg["dr"]) ** t for t in range(1, cfg["life"] + 1))
+    # IRR Newton-Raphson
     irr = None
     try:
-        cashflows = [-capex] + [net_ann] * life
-        r = 0.1
+        cf = [-capex] + [net_ann] * cfg["life"]
+        r  = 0.1
         for _ in range(200):
-            f  = sum(cashflows[t] / (1 + r) ** t for t in range(life + 1))
-            df = sum(-t * cashflows[t] / (1 + r) ** (t + 1) for t in range(1, life + 1))
+            f  = sum(cf[t] / (1 + r) ** t for t in range(cfg["life"] + 1))
+            df = sum(-t * cf[t] / (1 + r) ** (t + 1) for t in range(1, cfg["life"] + 1))
             if df == 0: break
             r2 = r - f / df
-            if abs(r2 - r) < 1e-7:
-                irr = r2; break
+            if abs(r2 - r) < 1e-7: irr = r2; break
             r = r2
     except Exception:
         pass
-
-    # Min tariff for 7-yr payback
-    opex_per_sub = opex / max(sub_r + sub_s, 1)
-    capex_per_sub = capex / max(sub_r + sub_s, 1)
-    req_rev_sub = capex_per_sub / 7 + opex_per_sub   # per subscriber per year
-    total_subs_weighted = sub_r + sub_s * (tar_s / max(tar_r, 0.01))
-    req_tariff_r = req_rev_sub / 12 if total_subs_weighted > 0 else None
+    # Tarif min pour payback 7 ans
+    opex_sub    = opex / max(sub_r + sub_s, 1)
+    capex_sub   = capex / max(sub_r + sub_s, 1)
+    req_rev_sub = capex_sub / 7 + opex_sub
+    req_tar_r   = req_rev_sub / 12
 
     return {
-        "subscribers_residential": sub_r,
-        "subscribers_sme":         sub_s,
-        "peak_kwp":    round(peak_kwp, 1),
-        "batt_kwh":    round(batt_kwh, 1),
-        "capex_eur":   round(capex),
-        "ann_revenue": round(ann_rev),
-        "opex":        round(opex),
-        "net_annual":  round(net_ann),
-        "payback_yrs": round(payback, 1),
-        "npv_eur":     round(npv),
-        "irr_pct":     round(irr * 100, 1) if irr else None,
-        "req_tariff_residential": round(req_tariff_r, 2) if req_tariff_r else None,
+        "sub_r": sub_r, "sub_s": sub_s,
+        "peak_kwp": round(peak_kwp, 1),
+        "batt_kwh": round(batt_kwh, 1),
+        "capex":    round(capex),
+        "ann_rev":  round(ann_rev),
+        "opex":     round(opex),
+        "net_ann":  round(net_ann),
+        "payback":  round(payback, 1),
+        "npv":      round(npv),
+        "irr":      round(irr * 100, 1) if irr else None,
+        "req_tar_r": round(req_tar_r, 2),
     }
 
 def priority_score(fin, ghi, grid_km):
-    score = 0; breakdown = {}
-    # Financial (40 pts)
-    pb = fin["payback_yrs"] if fin else 999
-    f = 40 if pb <= 5 else 30 if pb <= 7 else 15 if pb <= 10 else 0
-    score += f; breakdown["financial"] = f
-    # Solar (20 pts)
-    s = min(20, round(ghi / 6.5 * 20))
-    score += s; breakdown["solar"] = s
-    # Grid isolation (20 pts)
-    g = 20 if grid_km > 50 else 10 if grid_km > 20 else 0
-    score += g; breakdown["grid_isolation"] = g
-    # Market size proxy: SME presence (10 pts) — already baked into financials
-    # but we give bonus for SME > 10
-    breakdown["score"] = score
-    return breakdown
+    """
+    Score /80 pts :
+      - Finance  40 pts  (payback <= 5 = 40, <=7 = 30, <=10 = 15, >10 = 0)
+      - Solaire  20 pts  (GHI / 6.5 * 20, plafonné à 20)
+      - Réseau   20 pts  (>50 km = 20, 20-50 km = 12, 10-20 km = 6, <10 km = 0)
+      NOTE: distance à vol d'oiseau — présence réelle du réseau peut différer.
+    """
+    pb = fin["payback"] if fin else 999
+    f  = 40 if pb <= 5 else 30 if pb <= 7 else 15 if pb <= 10 else 0
+    s  = min(20, round(ghi / 6.5 * 20))
+    g  = 20 if grid_km > 50 else 12 if grid_km > 20 else 6 if grid_km > 10 else 0
+    return {"total": f + s + g, "finance": f, "solaire": s, "reseau": g}
 
 def make_map(lat, lon, res_blds, sme_blds, radius_km, name):
     m = folium.Map(
@@ -279,39 +377,38 @@ def make_map(lat, lon, res_blds, sme_blds, radius_km, name):
         attr="Esri Labels", name="Labels", overlay=True, control=True, opacity=0.7,
     ).add_to(m)
     folium.Circle(location=[lat, lon], radius=radius_km * 1000,
-                  color="#60A5FA", fill=True, fill_opacity=0.08, weight=2).add_to(m)
+                  color="#FFC500", fill=True, fill_opacity=0.07, weight=2).add_to(m)
     folium.Marker(location=[lat, lon],
                   popup=f"<b>{name}</b>",
-                  icon=folium.Icon(color="blue", icon="home", prefix="fa")).add_to(m)
+                  icon=folium.Icon(color="orange", icon="home", prefix="fa")).add_to(m)
     for blat, blon in res_blds[:2500]:
         folium.CircleMarker(location=[blat, blon], radius=3,
                             color="#FF4500", fill=True, fill_opacity=0.85, weight=0).add_to(m)
     for blat, blon in sme_blds[:500]:
         folium.CircleMarker(location=[blat, blon], radius=6,
-                            color="#FFD700", fill=True, fill_opacity=0.9, weight=1,
-                            tooltip="Commercial / SME").add_to(m)
+                            color="#FFC500", fill=True, fill_opacity=0.9, weight=1,
+                            tooltip="Commerce / PME").add_to(m)
     folium.LayerControl().add_to(m)
     return m
 
-# ── Main search ────────────────────────────────────────────────────────────────
+# ── Recherche principale ───────────────────────────────────────────────────────
 
-def run_search(village_name, min_conf, sme_threshold):
-    res = {"village": village_name, "min_conf": min_conf, "error": None,
-           "snapshot": {}, "lat": None, "lon": None, "display_name": None,
-           "candidates": [], "tile_count": 0, "ghi_annual": None,
-           "ghi_monthly": None, "grid_km": None, "grid_town": None}
+def run_search(village_name, sme_threshold):
+    res = {"village": village_name, "error": None, "snapshot": {},
+           "lat": None, "lon": None, "display_name": None, "candidates": [],
+           "tile_count": 0, "ghi_annual": None, "ghi_monthly": None,
+           "grid_km": None, "grid_town": None}
 
-    with st.status(f"Analysing **{village_name}**...", expanded=True) as status:
-        # 1. Geocode
-        st.write("Locating village via OpenStreetMap...")
+    with st.status(f"Analyse de **{village_name}**...", expanded=True) as status:
+        st.write("Localisation via OpenStreetMap...")
         candidates = geocode(village_name)
         mada = ([c for c in candidates
                  if "Madagascar" in c.get("display_name", "")
                  or c.get("address", {}).get("country_code") == "mg"]
                 or candidates)
         if not mada:
-            status.update(label="Village not found", state="error")
-            res["error"] = f"No result for '{village_name}' in Madagascar."
+            status.update(label="Village introuvable", state="error")
+            res["error"] = f"Aucun résultat pour « {village_name} » à Madagascar."
             st.session_state["result"] = res; return
 
         res["candidates"] = mada
@@ -319,24 +416,19 @@ def run_search(village_name, min_conf, sme_threshold):
         lat, lon = float(chosen["lat"]), float(chosen["lon"])
         res["lat"], res["lon"] = lat, lon
         res["display_name"] = chosen.get("display_name", village_name)
-        st.write(f"Found: ({lat:.4f}, {lon:.4f})")
+        st.write(f"Trouvé : ({lat:.4f}, {lon:.4f})")
 
-        # 2. Solar resource
-        st.write("Fetching solar resource (NASA POWER)...")
+        st.write("Ressource solaire — NASA POWER...")
         ghi_ann, ghi_monthly = get_ghi(lat, lon)
-        res["ghi_annual"]  = ghi_ann
-        res["ghi_monthly"] = ghi_monthly
-        st.write(f"GHI: {ghi_ann:.2f} kWh/m²/day (annual average)")
+        res["ghi_annual"] = ghi_ann; res["ghi_monthly"] = ghi_monthly
+        st.write(f"GHI annuel : {ghi_ann:.2f} kWh/m²/jour")
 
-        # 3. Grid distance
-        st.write("Calculating distance to JIRAMA grid...")
+        st.write("Distance réseau JIRAMA...")
         grid_km, grid_town = get_grid_distance(lat, lon)
-        res["grid_km"]   = grid_km
-        res["grid_town"] = grid_town
-        st.write(f"Nearest grid: {grid_town} ({grid_km} km)")
+        res["grid_km"] = grid_km; res["grid_town"] = grid_town
+        st.write(f"Ville JIRAMA la plus proche : {grid_town} ({grid_km} km à vol d'oiseau)")
 
-        # 4. Tiles
-        st.write("Identifying satellite tiles...")
+        st.write("Identification des tuiles satellitaires...")
         tokens  = get_s2_tokens(lat, lon, 4)
         ll      = s2sphere.LatLng.from_degrees(lat, lon)
         pri_tok = s2sphere.CellId.from_lat_lng(ll).parent(4).to_token()
@@ -344,338 +436,362 @@ def run_search(village_name, min_conf, sme_threshold):
                    for (ok, sz) in [tile_exists(t)] if ok
                    if t == pri_tok or sz <= 20e6]
         if not needed:
-            status.update(label="No satellite data for this area", state="error")
-            res["error"] = "No Google Open Buildings tiles available here."
+            status.update(label="Aucune donnée satellite disponible", state="error")
+            res["error"] = "Pas de tuile Google Open Buildings pour cette zone."
             st.session_state["result"] = res; return
-        st.write(f"{len(needed)} tile(s) to process")
+        st.write(f"{len(needed)} tuile(s) à traiter")
 
         tile_paths = []
         for tok, sz in needed:
             cached = os.path.join(TILE_CACHE_DIR, f"{tok}_buildings.csv.gz")
-            label  = f"Cached ({sz/1e6:.1f} MB)" if os.path.exists(cached) else f"Downloading ({sz/1e6:.1f} MB)..."
-            st.write(f"   {tok}: {label}")
+            label  = f"Cache ({sz/1e6:.1f} Mo)" if os.path.exists(cached) else f"Téléchargement ({sz/1e6:.1f} Mo)..."
+            st.write(f"   {tok} : {label}")
             try:
                 tile_paths.append(download_tile(tok))
             except Exception as e:
-                st.warning(f"   Skipped {tok}: {e}")
+                st.warning(f"   Ignoré {tok} : {e}")
         if not tile_paths:
-            status.update(label="Download failed", state="error")
-            res["error"] = "Could not download tiles."
+            status.update(label="Échec du téléchargement", state="error")
+            res["error"] = "Impossible de télécharger les tuiles."
             st.session_state["result"] = res; return
 
-        # 5. Count buildings
-        st.write(f"Counting buildings (confidence >= {min_conf:.0%}, SME >= {sme_threshold} m²)...")
-        snapshot = count_buildings_detailed(lat, lon, tile_paths, SNAPSHOT_RADII, min_conf, sme_threshold)
-        res["snapshot"]   = snapshot
-        res["tile_count"] = len(tile_paths)
+        st.write(f"Comptage des bâtiments (seuil confiance {MIN_CONFIDENCE:.0%}, PME >= {sme_threshold} m²)...")
+        snapshot = count_buildings_detailed(lat, lon, tile_paths, SNAPSHOT_RADII, sme_threshold)
+        res["snapshot"] = snapshot; res["tile_count"] = len(tile_paths)
         n2 = snapshot.get(2.0, {}).get("total", 0)
-        status.update(label=f"Done — {n2:,} buildings within 2 km", state="complete", expanded=False)
+        status.update(label=f"Terminé — {n2:,} bâtiments dans un rayon de 2 km",
+                      state="complete", expanded=False)
 
     st.session_state["result"] = res
 
-# ── UI ─────────────────────────────────────────────────────────────────────────
-
-st.markdown("""
-<style>
-  .title   { font-size:1.9rem; font-weight:800; color:#1F4E79; margin:0 }
-  .sub     { font-size:.88rem; color:#6B7280; margin:.2rem 0 1.2rem }
-  .badge   { display:inline-block; background:#DBEAFE; color:#1E40AF;
-             font-size:.70rem; font-weight:700; padding:2px 9px;
-             border-radius:10px; margin-right:5px }
-  .kcard   { background:#F0F9FF; border-left:4px solid #0284C7;
-             padding:.8rem 1.2rem; border-radius:8px; margin:.4rem 0 }
-  .knum    { font-size:2.2rem; font-weight:900; color:#0C4A6E; line-height:1.1 }
-  .klbl    { font-size:.8rem; color:#555; margin-top:.2rem }
-  .verdict-go   { background:#D1FAE5; border-left:5px solid #10B981;
-                  padding:1rem 1.5rem; border-radius:8px; margin:1rem 0 }
-  .verdict-meh  { background:#FEF3C7; border-left:5px solid #F59E0B;
-                  padding:1rem 1.5rem; border-radius:8px; margin:1rem 0 }
-  .verdict-no   { background:#FEE2E2; border-left:5px solid #EF4444;
-                  padding:1rem 1.5rem; border-radius:8px; margin:1rem 0 }
-  .vhead   { font-size:1.4rem; font-weight:800; margin-bottom:.3rem }
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown('<p class="title">☀️ WeLight — Village Solar Decision Tool</p>', unsafe_allow_html=True)
-st.markdown(
-    '<p class="sub">Enter a village name to get rooftop count, solar resource, grid distance and investment projections.'
-    '&nbsp;<span class="badge">Google Open Buildings v3</span>'
-    '<span class="badge">NASA POWER GHI</span>'
-    '<span class="badge">WeLight Africa</span></p>',
-    unsafe_allow_html=True,
-)
-
-# ── Sidebar: parameters ────────────────────────────────────────────────────────
+# ── Sidebar : paramètres ───────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Parameters")
+    st.markdown("## Paramètres")
     st.caption(
-        "**Calibrated on WeLight's 172-village Madagascar portfolio.** "
-        "Defaults reflect WeLight's observed tariffs (~EUR 2.50/HH/month), "
-        "penetration (~70%) and CAPEX efficiency (~EUR 900/kWp at scale). "
-        "Adjust for your own context."
+        "Valeurs par défaut calibrées sur le portefeuille WeLight "
+        "(172 villages opérés à Madagascar). "
+        "Modifiez selon votre contexte terrain."
     )
-    st.subheader("Detection")
-    min_conf      = st.selectbox("Confidence threshold", [0.0, 0.5, 0.6, 0.7, 0.8], index=2,
-                                 format_func=lambda x: "All" if x == 0.0 else f">={x:.0%}",
-                                 help="ML confidence. 60% = recommended.")
-    sme_threshold = st.number_input("Min area for SME (m²)", min_value=50, max_value=1000,
-                                    value=150, step=25,
-                                    help="Buildings >= this area are classified as commercial/SME. Madagascar rural homes average 30-60 m².")
 
-    st.subheader("Residential customers")
-    pen_r   = st.slider("Penetration rate — residential", 0.10, 1.0, 0.70, 0.05,
-                        format="%.0f%%", help="% of households that subscribe. WeLight achieves ~70% in practice.")
-    tar_r   = st.number_input("Monthly tariff — residential (EUR)", 0.5, 20.0, 2.50, 0.10,
-                               format="%.2f", help="WeLight charges ~EUR 2.50/month in northern Madagascar.")
-    kwh_r   = st.number_input("Daily consumption — residential (kWh)", 0.1, 3.0, 0.30, 0.05,
-                               format="%.2f")
+    st.markdown("### Détection PME")
+    sme_threshold = st.number_input(
+        "Surface min. bâtiment commercial (m²)", 50, 1000, 150, 25,
+        help="Bâtiments >= cette surface = PME/commerce. "
+             "Maison rurale malgache : 30-60 m² en moyenne."
+    )
 
-    st.subheader("Commercial / SME customers")
-    pen_s   = st.slider("Penetration rate — SME", 0.10, 1.0, 0.60, 0.05,
-                        format="%.0f%%")
-    tar_s   = st.number_input("Monthly tariff — SME (EUR)", 1.0, 100.0, 12.00, 0.50,
-                               format="%.2f", help="Commercial customers typically pay EUR 10-15/month.")
-    kwh_s   = st.number_input("Daily consumption — SME (kWh)", 0.5, 20.0, 2.00, 0.25,
-                               format="%.2f")
+    st.markdown("### Clients résidentiels")
+    pen_r = st.slider("Taux de pénétration résidentiel", 0.10, 1.0, 0.70, 0.05,
+                      format="%.0f%%",
+                      help="Part des ménages abonnés. WeLight atteint ~70% en pratique.")
+    tar_r = st.number_input("Tarif mensuel résidentiel (EUR)", 0.5, 20.0, 2.50, 0.10,
+                             format="%.2f",
+                             help="WeLight pratique ~2,50 EUR/mois dans le nord de Madagascar.")
+    kwh_r = st.number_input("Consommation résidentielle (kWh/jour)", 0.1, 3.0, 0.30, 0.05,
+                             format="%.2f")
 
-    st.subheader("System & finance")
-    capex_kwp  = st.number_input("CAPEX per kWp (EUR)", 500, 3000, 900, 50,
-                                  help="EUR 900-1000/kWp for an experienced operator like WeLight. EUR 1200+ for first project.")
-    eff        = st.slider("System efficiency", 0.50, 0.90, 0.75, 0.01, format="%.0f%%")
-    batt_days  = st.slider("Battery autonomy (days)", 0.5, 3.0, 1.5, 0.25)
-    opex_pct   = st.slider("OPEX (% of CAPEX / yr)", 0.01, 0.10, 0.04, 0.005, format="%.1f%%")
-    dr         = st.slider("Discount rate", 0.05, 0.25, 0.08, 0.01, format="%.0f%%",
-                           help="8% for DFI-backed projects (EIB/Triodos concessional). 12-15% for commercial capital.")
-    life       = st.number_input("Project lifetime (years)", 5, 30, 15, 1)
+    st.markdown("### Clients PME / Commerces")
+    pen_s = st.slider("Taux de pénétration PME", 0.10, 1.0, 0.60, 0.05, format="%.0f%%")
+    tar_s = st.number_input("Tarif mensuel PME (EUR)", 1.0, 100.0, 12.00, 0.50,
+                             format="%.2f",
+                             help="Les PME paient généralement 10-15 EUR/mois pour une alimentation fiable.")
+    kwh_s = st.number_input("Consommation PME (kWh/jour)", 0.5, 20.0, 2.00, 0.25,
+                             format="%.2f")
+
+    st.markdown("### Système & finance")
+    capex_kwp = st.number_input("CAPEX par kWp (EUR)", 500, 3000, 900, 50,
+                                 help="900-1 000 EUR/kWp pour un opérateur expérimenté. "
+                                      "1 200+ EUR pour un premier projet.")
+    eff       = st.slider("Efficacité système", 0.50, 0.90, 0.75, 0.01, format="%.0f%%")
+    batt_days = st.slider("Autonomie batterie (jours)", 0.5, 3.0, 1.5, 0.25)
+    opex_pct  = st.slider("OPEX (% du CAPEX / an)", 0.01, 0.10, 0.04, 0.005,
+                          format="%.1f%%")
+    dr        = st.slider("Taux d'actualisation", 0.05, 0.25, 0.08, 0.01, format="%.0f%%",
+                          help="8% pour financement DFI (BEI/Triodos). "
+                               "12-15% pour capital commercial.")
+    life      = st.number_input("Durée du projet (ans)", 5, 30, 15, 1)
 
     cfg = {
-        "penetration_residential": pen_r,
-        "penetration_sme":         pen_s,
-        "tariff_residential_eur":  tar_r,
-        "tariff_sme_eur":          tar_s,
-        "kwh_per_hh_day":          kwh_r,
-        "kwh_per_sme_day":         kwh_s,
-        "capex_per_kwp_eur":       capex_kwp,
-        "system_efficiency":       eff,
-        "battery_autonomy_days":   batt_days,
-        "opex_pct_capex":          opex_pct,
-        "discount_rate":           dr,
-        "project_lifetime_years":  int(life),
+        "pen_r": pen_r, "pen_s": pen_s,
+        "tar_r": tar_r, "tar_s": tar_s,
+        "kwh_r": kwh_r, "kwh_s": kwh_s,
+        "cpkwp": capex_kwp, "eff": eff,
+        "batt":  batt_days, "opex_p": opex_pct,
+        "dr": dr, "life": int(life),
     }
 
-# ── Search bar ─────────────────────────────────────────────────────────────────
+# ── Barre de recherche ─────────────────────────────────────────────────────────
 col_v, col_b = st.columns([5, 1])
 with col_v:
-    village_input = st.text_input("Village", placeholder="e.g. Betsiaka, Ambilobe, Farahalana...",
-                                  label_visibility="collapsed")
+    village_input = st.text_input(
+        "Village", label_visibility="collapsed",
+        placeholder="Ex. : Betsiaka, Tsarabaria, Mahavanona, Farahalana..."
+    )
 with col_b:
-    search = st.button("🔍 Analyse", type="primary", use_container_width=True)
+    search = st.button("🔍 Analyser", type="primary", use_container_width=True)
 
 if search:
     if village_input.strip():
-        run_search(village_input.strip(), min_conf, sme_threshold)
+        run_search(village_input.strip(), sme_threshold)
     else:
-        st.warning("Please enter a village name.")
+        st.warning("Veuillez saisir un nom de village.")
 
-# ── Results ────────────────────────────────────────────────────────────────────
+# ── Affichage des résultats ────────────────────────────────────────────────────
 res = st.session_state["result"]
 if res:
     if res["error"]:
         st.error(res["error"])
     else:
-        # Candidate selector
+        # Sélecteur si plusieurs résultats OSM
         if len(res["candidates"]) > 1:
             opts = {
-                f"{c['display_name'][:75]}  ({float(c['lat']):.3f}, {float(c['lon']):.3f})": i
+                f"{c['display_name'][:80]}  ({float(c['lat']):.3f}, {float(c['lon']):.3f})": i
                 for i, c in enumerate(res["candidates"][:5])
             }
-            idx = opts[st.selectbox("Multiple OSM results — choose the right one:", list(opts.keys()))]
-            ch = res["candidates"][idx]
+            idx = opts[st.selectbox("Plusieurs résultats OSM — choisissez le bon :", list(opts.keys()))]
+            ch  = res["candidates"][idx]
             res["lat"], res["lon"] = float(ch["lat"]), float(ch["lon"])
             res["display_name"] = ch.get("display_name", res["village"])
 
-        lat   = res["lat"]; lon = res["lon"]
+        lat   = res["lat"];  lon  = res["lon"]
         name  = res["village"]
         snap  = res["snapshot"]
         ghi   = res["ghi_annual"] or 5.5
         ghim  = res["ghi_monthly"] or [None] * 12
         gkm   = res["grid_km"] or 0
-        gtown = res["grid_town"] or "unknown"
+        gtown = res["grid_town"] or "inconnue"
+        dname = res["display_name"] or name
 
-        d2 = snap.get(2.0, {})
+        d2    = snap.get(2.0, {})
         n_res = d2.get("residential", 0)
         n_sme = d2.get("sme", 0)
         n_tot = d2.get("total", 0)
 
-        # Recompute financials live with current sidebar params
-        fin = compute_financials(n_res, n_sme, ghi, cfg)
-        score = priority_score(fin, ghi, gkm) if fin else {}
+        fin   = compute_financials(n_res, n_sme, ghi, cfg)
+        sc    = priority_score(fin, ghi, gkm)
 
-        # ── Verdict ──────────────────────────────────────────────────────────
-        st.markdown("---")
+        # ── Alerte coordonnées suspectes ──────────────────────────────────────
+        if n2 < 30 if (n2 := n_tot) else False:
+            if any(t in dname.lower() for t in ["district", "province", "region", "diana", "sava", "sofia"]):
+                st.markdown(
+                    f'<div class="warn-box">⚠️ Les coordonnées semblent pointer sur une limite administrative, '
+                    f'pas sur le centre du village. '
+                    f'<a href="https://maps.google.com/?q={lat},{lon}" target="_blank">Vérifier sur Google Maps</a></div>',
+                    unsafe_allow_html=True,
+                )
+
+        # ── Verdict ───────────────────────────────────────────────────────────
         if fin:
-            pb = fin["payback_yrs"]
-            sc = score.get("score", 0)
-            if pb <= 7 and sc >= 50:
-                vcls, vicon, vtxt = "verdict-go",  "✅ INVEST",       "Strong fundamentals: short payback and good solar+grid isolation."
-            elif pb <= 12 and sc >= 30:
-                vcls, vicon, vtxt = "verdict-meh", "🔶 TO EVALUATE",  "Mixed signals — adjust parameters or plan a field visit."
+            pb = fin["payback"]; total_sc = sc["total"]
+            if pb <= 7 and total_sc >= 42:
+                vcls  = "verdict-invest"
+                vicon = "✅"
+                vtit  = "INVESTIR"
+                vsub  = f"Bonne viabilité : remboursement en {pb} ans, score {total_sc}/80."
+            elif pb <= 12 and total_sc >= 27:
+                vcls  = "verdict-evaluate"
+                vicon = "🔶"
+                vtit  = "À ÉVALUER"
+                vsub  = f"Signaux mixtes — remboursement {pb} ans, score {total_sc}/80. Visite terrain recommandée."
             else:
-                vcls, vicon, vtxt = "verdict-no",  "❌ DO NOT INVEST","Payback too long or score too low under current assumptions."
+                vcls  = "verdict-no"
+                vicon = "❌"
+                vtit  = "NE PAS INVESTIR"
+                vsub  = f"Remboursement trop long ({pb} ans) ou score insuffisant ({total_sc}/80) dans les conditions actuelles."
+
             st.markdown(f"""
             <div class="{vcls}">
-              <div class="vhead">{vicon} &nbsp; {name.upper()}</div>
-              <div>{vtxt} &nbsp; Score: <b>{sc}/80</b> &nbsp;·&nbsp; Payback: <b>{pb} yrs</b></div>
+              <span class="verdict-icon">{vicon}</span>
+              <span class="verdict-title">{name.upper()} — {vtit}</span>
+              <div class="verdict-sub">{vsub}</div>
             </div>""", unsafe_allow_html=True)
 
-        # ── Key metrics row ───────────────────────────────────────────────────
+            # Barre de score
+            pct = int(total_sc / 80 * 100)
+            st.markdown(f"""
+            <div style="font-size:.8rem;color:#888;margin-bottom:2px">
+              Score global : <b style="color:#1A1A1A">{total_sc} / 80 pts</b>
+              &nbsp;·&nbsp; Finance : {sc['finance']}/40
+              &nbsp;·&nbsp; Solaire : {sc['solaire']}/20
+              &nbsp;·&nbsp; Réseau : {sc['reseau']}/20
+            </div>
+            <div class="score-bar-bg">
+              <div class="score-bar-fill" style="width:{pct}%"></div>
+            </div>""", unsafe_allow_html=True)
+
+        # ── Métriques clés ────────────────────────────────────────────────────
+        st.markdown("---")
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("🏠 Residential buildings (2 km)", f"{n_res:,}")
-        c2.metric("🏪 Commercial / SME (2 km)", f"{n_sme:,}",
-                  help=f"Buildings >= {sme_threshold} m²")
-        c3.metric("☀️ GHI (annual avg)", f"{ghi:.2f} kWh/m²/d")
-        c4.metric("🔌 Grid distance", f"{gkm} km",
-                  help=f"Nearest JIRAMA: {gtown}")
-        c5.metric("👥 Pop. estimate", f"{n_tot*4:,}",
-                  help="Total buildings × 4 persons/household")
+        c1.metric("🏠 Bâtiments résidentiels", f"{n_res:,}",
+                  help="Rayon 2 km, confiance ≥ 60%")
+        c2.metric("🏪 PME / Commerces", f"{n_sme:,}",
+                  help=f"Bâtiments ≥ {sme_threshold} m²")
+        c3.metric("☀️ GHI annuel moyen", f"{ghi:.2f} kWh/m²/j")
+        c4.metric("🔌 Distance réseau", f"{gkm} km",
+                  help=f"Ville JIRAMA la plus proche : {gtown} (distance à vol d'oiseau — pas la présence réelle du réseau)")
+        c5.metric("👥 Population estimée", f"{n_tot * 4:,}",
+                  help="Bâtiments totaux × 4 pers./ménage")
 
-        # ── Tabs ──────────────────────────────────────────────────────────────
-        tab1, tab2, tab3 = st.tabs(["📊 Financial model", "🗺️ Map", "📈 Solar profile"])
+        # Note distance réseau
+        if gkm <= 25:
+            st.markdown(
+                f'<div class="info-box">ℹ️ <b>Distance réseau :</b> {gtown} est à {gkm} km à vol d\'oiseau, '
+                f'mais la présence réelle du réseau JIRAMA dans ce village est à vérifier sur le terrain. '
+                f'Des villages WeLight confirmés (ex. Mahavanona, 15 km d\'Antsiranana) sont dans cette configuration et restent viables.</div>',
+                unsafe_allow_html=True,
+            )
 
-        # Tab 1: Financial model
+        # ── Onglets ───────────────────────────────────────────────────────────
+        tab1, tab2, tab3 = st.tabs(["💶 Modèle financier", "🗺️ Carte satellite", "☀️ Profil solaire"])
+
+        # ── Onglet 1 : Finance ────────────────────────────────────────────────
         with tab1:
             if fin:
-                st.subheader("Revenue & investment projection")
+                st.subheader("Projection revenus & investissement")
                 fc1, fc2, fc3 = st.columns(3)
-                fc1.metric("System size", f"{fin['peak_kwp']} kWp")
-                fc1.metric("Battery storage", f"{fin['batt_kwh']} kWh")
-                fc2.metric("Total CAPEX", f"EUR {fin['capex_eur']:,}")
-                fc2.metric("Annual revenue", f"EUR {fin['ann_revenue']:,}")
-                fc3.metric("Payback period", f"{fin['payback_yrs']} yrs",
-                           delta=f"{'OK' if fin['payback_yrs'] <= 7 else 'Too long'}",
-                           delta_color="normal" if fin["payback_yrs"] <= 7 else "inverse")
-                fc3.metric("NPV (15 yr)", f"EUR {fin['npv_eur']:,}",
-                           delta_color="normal" if fin["npv_eur"] > 0 else "inverse")
-                if fin["irr_pct"]:
-                    fc3.metric("IRR", f"{fin['irr_pct']}%")
+                fc1.metric("Puissance crête", f"{fin['peak_kwp']} kWc")
+                fc1.metric("Stockage batterie", f"{fin['batt_kwh']} kWh")
+                fc2.metric("CAPEX total", f"EUR {fin['capex']:,}")
+                fc2.metric("Revenus annuels", f"EUR {fin['ann_rev']:,}")
+                fc3.metric("Remboursement", f"{fin['payback']} ans",
+                           delta="OK" if fin["payback"] <= 7 else "Trop long",
+                           delta_color="normal" if fin["payback"] <= 7 else "inverse")
+                fc3.metric("VAN (15 ans)", f"EUR {fin['npv']:,}",
+                           delta_color="normal" if fin["npv"] > 0 else "inverse")
+                if fin["irr"]:
+                    fc3.metric("TRI", f"{fin['irr']}%")
 
-                st.markdown("#### Subscriber breakdown")
+                st.markdown("#### Répartition abonnés")
                 sc1, sc2 = st.columns(2)
-                sc1.metric("Residential subscribers",
-                           f"{fin['subscribers_residential']:,}",
-                           help=f"{pen_r:.0%} of {n_res:,} residential buildings")
-                sc2.metric("SME subscribers",
-                           f"{fin['subscribers_sme']:,}",
-                           help=f"{pen_s:.0%} of {n_sme:,} SME buildings")
+                sc1.metric("Abonnés résidentiels", f"{fin['sub_r']:,}",
+                           help=f"{pen_r:.0%} de {n_res:,} bâtiments résidentiels")
+                sc2.metric("Abonnés PME", f"{fin['sub_s']:,}",
+                           help=f"{pen_s:.0%} de {n_sme:,} PME détectées")
 
-                rev_res = fin["subscribers_residential"] * tar_r * 12
-                rev_sme = fin["subscribers_sme"]         * tar_s * 12
+                rev_res = fin["sub_r"] * tar_r * 12
+                rev_sme = fin["sub_s"] * tar_s * 12
                 if rev_res + rev_sme > 0:
                     sme_share = rev_sme / (rev_res + rev_sme) * 100
-                    st.caption(f"SME revenue share: **{sme_share:.0f}%** "
-                               f"(EUR {rev_sme:,.0f} / yr) vs residential EUR {rev_res:,.0f} / yr")
+                    st.caption(
+                        f"Part PME dans les revenus : **{sme_share:.0f}%** "
+                        f"(EUR {rev_sme:,.0f}/an) vs résidentiel EUR {rev_res:,.0f}/an"
+                    )
 
-                if fin["req_tariff_residential"]:
-                    req = fin["req_tariff_residential"]
-                    if req > tar_r:
-                        st.warning(
-                            f"For a 7-year payback, the residential tariff needs to be "
-                            f"**EUR {req:.2f}/month** (currently EUR {tar_r:.2f}). "
-                            f"Try increasing the SME tariff or penetration rate instead."
-                        )
-                    else:
-                        st.success(f"Current tariff (EUR {tar_r:.2f}) exceeds the minimum "
-                                   f"required (EUR {req:.2f}) for 7-year payback. ✓")
+                # Tarif min
+                req = fin["req_tar_r"]
+                if req > tar_r:
+                    st.markdown(
+                        f'<div class="warn-box">⚠️ Pour un remboursement en 7 ans, le tarif résidentiel '
+                        f'doit atteindre <b>EUR {req:.2f}/mois</b> (actuellement EUR {tar_r:.2f}). '
+                        f'Essayez d\'augmenter le tarif PME ou le taux de pénétration.</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div class="info-box">✅ Le tarif actuel (EUR {tar_r:.2f}) est supérieur au minimum '
+                        f'requis (EUR {req:.2f}) pour un remboursement en 7 ans.</div>',
+                        unsafe_allow_html=True,
+                    )
 
-                # 15-year cashflow
-                st.markdown("#### 15-year cash flow")
-                import io
-                years  = list(range(0, int(life) + 1))
-                ann_net = fin["net_annual"]
-                cf = [-fin["capex_eur"]] + [ann_net] * int(life)
-                cum = []
-                s = 0
-                for v in cf:
-                    s += v; cum.append(s)
+                # Cashflow cumulé
+                st.markdown("#### Flux de trésorerie cumulé (15 ans)")
+                ann_net = fin["net_ann"]
+                cf  = [-fin["capex"]] + [ann_net] * int(life)
+                cum = []; s = 0
+                for v in cf: s += v; cum.append(s)
+                df_cf = pd.DataFrame({
+                    "Année": list(range(0, int(life) + 1)),
+                    "Flux cumulé (EUR)": cum
+                }).set_index("Année")
+                st.line_chart(df_cf, color="#FFC500")
 
-                # Build a simple bar-chart data dict for streamlit
-                chart_data = {"Year": years, "Cumulative cash flow (EUR)": cum}
-                import pandas as pd
-                df_cf = pd.DataFrame(chart_data).set_index("Year")
-                st.line_chart(df_cf)
             else:
-                st.info("No subscribers with current parameters — adjust penetration rates or building counts.")
+                st.info("Aucun abonné avec les paramètres actuels — ajustez les taux de pénétration.")
 
-        # Tab 2: Map
+        # ── Onglet 2 : Carte ──────────────────────────────────────────────────
         with tab2:
             bld_res = d2.get("res_coords", [])
             bld_sme = d2.get("sme_coords", [])
             st_folium(make_map(lat, lon, bld_res, bld_sme, 2.0, name),
                       width=None, height=520, returned_objects=[])
             st.caption(
-                "🔴 Residential buildings &nbsp;·&nbsp; 🟡 Commercial / SME (hover for label) &nbsp;·&nbsp; "
-                "🔵 2 km radius &nbsp;·&nbsp; "
-                f"[Open in Google Maps](https://maps.google.com/?q={lat},{lon})"
+                "🔴 Bâtiments résidentiels &nbsp;·&nbsp; 🟡 PME / Commerces (survol = label) &nbsp;·&nbsp; "
+                f"Cercle jaune = rayon 2 km &nbsp;·&nbsp; "
+                f"[Ouvrir dans Google Maps](https://maps.google.com/?q={lat},{lon})"
             )
 
-            # Multi-radius table
-            st.markdown("#### Building counts by radius")
+            # Tableau multi-rayons
+            st.markdown("#### Bâtiments par rayon")
             rows = []
             for r in SNAPSHOT_RADII:
                 d = snap.get(r, {})
                 rows.append({
-                    "Radius": f"{r} km",
+                    "Rayon": f"{r} km",
                     "Total": d.get("total", 0),
-                    "Residential": d.get("residential", 0),
-                    "Commercial / SME": d.get("sme", 0),
-                    "Pop. estimate": d.get("total", 0) * 4,
+                    "Résidentiels": d.get("residential", 0),
+                    "PME / Commerces": d.get("sme", 0),
+                    "Pop. estimée": d.get("total", 0) * 4,
                 })
-            import pandas as pd
-            st.dataframe(pd.DataFrame(rows).set_index("Radius"), use_container_width=True)
+            st.dataframe(pd.DataFrame(rows).set_index("Rayon"), use_container_width=True)
 
-        # Tab 3: Solar profile
+        # ── Onglet 3 : Solaire ────────────────────────────────────────────────
         with tab3:
-            st.subheader("Monthly GHI profile")
-            months = ["Jan","Feb","Mar","Apr","May","Jun",
-                      "Jul","Aug","Sep","Oct","Nov","Dec"]
+            st.subheader("Profil GHI mensuel")
+            mois = ["Jan","Fév","Mar","Avr","Mai","Jun","Jul","Aoû","Sep","Oct","Nov","Déc"]
             if any(v for v in ghim if v):
-                import pandas as pd
                 df_ghi = pd.DataFrame({
-                    "Month": months,
-                    "GHI (kWh/m²/day)": [v if v else 0 for v in ghim],
-                }).set_index("Month")
-                st.bar_chart(df_ghi)
+                    "Mois": mois,
+                    "GHI (kWh/m²/jour)": [v if v else 0 for v in ghim],
+                }).set_index("Mois")
+                st.bar_chart(df_ghi, color="#FFC500")
                 min_m = min((v for v in ghim if v), default=0)
                 max_m = max((v for v in ghim if v), default=0)
                 st.caption(
-                    f"Annual average: **{ghi:.2f}** kWh/m²/day &nbsp;·&nbsp; "
-                    f"Min month: **{min_m:.2f}** &nbsp;·&nbsp; Max month: **{max_m:.2f}** &nbsp;·&nbsp; "
-                    f"Source: NASA POWER climatology"
+                    f"Moyenne annuelle : **{ghi:.2f}** kWh/m²/j &nbsp;·&nbsp; "
+                    f"Mois min : **{min_m:.2f}** &nbsp;·&nbsp; Mois max : **{max_m:.2f}** &nbsp;·&nbsp; "
+                    f"Source : NASA POWER climatologie"
                 )
                 if min_m < 4.0:
-                    st.warning(
-                        f"Low solar months detected ({min_m:.2f} kWh/m²/day). "
-                        "Consider increasing battery autonomy for year-round reliability."
+                    st.markdown(
+                        f'<div class="warn-box">⚠️ Mois à faible ensoleillement détectés '
+                        f'({min_m:.2f} kWh/m²/j). Augmentez l\'autonomie batterie pour une '
+                        f'alimentation fiable toute l\'année.</div>',
+                        unsafe_allow_html=True,
                     )
             else:
-                st.info(f"Monthly data unavailable. Using annual average: {ghi:.2f} kWh/m²/day")
+                st.info(f"Données mensuelles indisponibles. Moyenne annuelle utilisée : {ghi:.2f} kWh/m²/j")
 
-            st.markdown("#### Grid context")
+            st.markdown("#### Contexte réseau électrique")
             gcol1, gcol2 = st.columns(2)
-            gcol1.metric("Distance to JIRAMA grid", f"{gkm} km",
-                         help=f"Nearest electrified town: {gtown}")
+            gcol1.metric("Distance réseau JIRAMA", f"{gkm} km",
+                         help=f"Ville électrifiée la plus proche : {gtown}")
             if gkm > 50:
-                gcol2.markdown("🟢 **Highly isolated** — very low risk of grid extension reaching the village within 10 years.")
+                gcol2.markdown(
+                    '<div class="info-box">🟢 <b>Zone très isolée</b> — risque d\'extension du réseau '
+                    'dans les 10 ans très faible. Fort avantage compétitif pour le mini-réseau.</div>',
+                    unsafe_allow_html=True,
+                )
             elif gkm > 20:
-                gcol2.markdown("🟡 **Moderate isolation** — grid extension possible in 5-10 years. Factor into project horizon.")
+                gcol2.markdown(
+                    '<div class="warn-box">🟡 <b>Isolation modérée</b> — extension possible '
+                    'à 5-10 ans. À intégrer dans l\'horizon du projet.</div>',
+                    unsafe_allow_html=True,
+                )
             else:
-                gcol2.markdown("🔴 **Near grid** — JIRAMA extension likely. Consider shorter project horizon or co-investment model.")
+                gcol2.markdown(
+                    '<div class="info-box">ℹ️ <b>Proche d\'une ville électrifiée</b> — '
+                    'mais la distance à vol d\'oiseau ne signifie pas que le réseau JIRAMA '
+                    'atteint physiquement le village. Vérification terrain requise.</div>',
+                    unsafe_allow_html=True,
+                )
 
-# ── Footer ─────────────────────────────────────────────────────────────────────
+# ── Pied de page ───────────────────────────────────────────────────────────────
 st.divider()
 st.markdown(
-    "<small>☀️ WeLight Africa Solar Decision Tool &nbsp;·&nbsp; "
-    "Google Open Buildings v3 &nbsp;·&nbsp; NASA POWER GHI &nbsp;·&nbsp; "
-    "OpenStreetMap Nominatim &nbsp;·&nbsp; v1.0</small>",
+    "<small style='color:#999'>☀️ WeLight Africa — Outil Décisionnel Solaire v2.0 &nbsp;·&nbsp; "
+    "Google Open Buildings v3 (confiance ≥ 60%) &nbsp;·&nbsp; "
+    "NASA POWER GHI &nbsp;·&nbsp; "
+    "OpenStreetMap Nominatim &nbsp;·&nbsp; "
+    "Calibré sur 172 villages opérés à Madagascar</small>",
     unsafe_allow_html=True,
 )
