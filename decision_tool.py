@@ -28,6 +28,7 @@ NOMINATIM_URL  = "https://nominatim.openstreetmap.org/search"
 NASA_POWER_URL = "https://power.larc.nasa.gov/api/temporal/climatology/point"
 GSA_URL        = "https://api.globalsolaratlas.info/data/lta"
 PVGIS_URL      = "https://re.jrc.ec.europa.eu/api/v5_2/MRcalc"
+OVERPASS_URL   = "https://overpass-api.de/api/interpreter"
 SNAPSHOT_RADII = [1.0, 2.0, 5.0]
 MIN_CONFIDENCE = 0.6    # Seuil validé sur terrain nord Madagascar — non modifiable
 SME_AREA_M2    = 150    # Bâtiments >= 150 m² classifiés PME/commerces
@@ -476,13 +477,75 @@ def estimate_cyclone_risk(lat, lon):
         return 5   # Default
 
 
-def get_grid_distance(lat, lon):
+def _jirama_fallback(lat, lon):
+    """Distance à la ville électrifiée JIRAMA la plus proche (fallback hardcodé)."""
     best_d, best_name = None, None
     for tlat, tlon, tname in JIRAMA_TOWNS:
         d = haversine(lat, lon, tlat, tlon)
         if best_d is None or d < best_d:
             best_d, best_name = d, tname
-    return round(best_d, 1), best_name
+    return round(best_d, 1), best_name, "JIRAMA_fallback"
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def get_grid_distance(lat, lon):
+    """
+    Calcule la distance au réseau électrique le plus proche.
+
+    Stratégie :
+    1. Interroge Overpass API (OSM) : sous-stations, pylônes et lignes HT dans 75 km.
+       → Retourne la distance réelle à l'infrastructure électrique cartographiée.
+    2. Si Overpass échoue ou ne renvoie rien : fallback sur les 12 villes JIRAMA hardcodées.
+
+    Retourne (distance_km: float, description: str, source: str).
+    source = "OSM" | "JIRAMA_fallback"
+    """
+    overpass_query = f"""
+[out:json][timeout:25];
+(
+  node["power"~"substation|tower|pole"](around:75000,{lat},{lon});
+  way["power"="line"](around:75000,{lat},{lon});
+);
+out center;
+"""
+    try:
+        r = requests.post(
+            OVERPASS_URL,
+            data={"data": overpass_query},
+            headers={"User-Agent": "WeLight-Decision-Tool/1.0"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        elements = r.json().get("elements", [])
+
+        best_d, best_desc = None, None
+        for el in elements:
+            if el["type"] == "node":
+                elat, elon = el["lat"], el["lon"]
+                tags  = el.get("tags", {})
+                ptype = tags.get("power", "infrastructure")
+                pname = tags.get("name", "")
+            elif el["type"] == "way" and "center" in el:
+                elat, elon = el["center"]["lat"], el["center"]["lon"]
+                tags    = el.get("tags", {})
+                voltage = tags.get("voltage", "")
+                pname   = tags.get("name", "")
+                ptype   = f"ligne HT{(' ' + voltage + ' V') if voltage else ''}"
+            else:
+                continue
+
+            d = haversine(lat, lon, elat, elon)
+            if best_d is None or d < best_d:
+                best_d    = d
+                best_desc = ptype + (f" — {pname}" if pname else "")
+
+        if best_d is not None:
+            return round(best_d, 1), best_desc, "OSM"
+
+    except Exception:
+        pass  # réseau indisponible ou timeout → fallback
+
+    return _jirama_fallback(lat, lon)
 
 
 def compute_financials(n_res, n_sme, ghi, cfg):
@@ -556,7 +619,7 @@ def priority_score(fin, ghi, grid_km, stability, climate):
       - Réseau    20 pts  (>50 km = 20, 20-50 km = 12, 10-20 km = 6, <10 km = 0)
       - Stabilité 10 pts  (stability / 10 * 10)
       - Climat    10 pts  (climate / 10 * 10)
-      NOTE: distance à vol d'oiseau — présence réelle du réseau peut différer.
+      NOTE: distance à vol d'oiseau — source OSM si disponible, sinon ville JIRAMA la plus proche.
     """
     pb = fin["payback"] if fin else 999
     f  = 40 if pb <= 5 else 30 if pb <= 7 else 15 if pb <= 10 else 0
@@ -606,7 +669,7 @@ def run_search(village_name, sme_threshold):
     res = {"village": village_name, "error": None, "snapshot": {},
            "lat": None, "lon": None, "display_name": None, "candidates": [],
            "tile_count": 0, "ghi_annual": None, "ghi_monthly": None,
-           "ghi_source": None, "grid_km": None, "grid_town": None}
+           "ghi_source": None, "grid_km": None, "grid_desc": None, "grid_source": None}
 
     with st.status(f"Analyse de **{village_name}**...", expanded=True) as status:
 
@@ -652,10 +715,13 @@ def run_search(village_name, sme_threshold):
         res["ghi_source"] = ghi_source
         st.write(f"GHI annuel : {ghi_ann:.2f} kWh/m²/jour (source : {ghi_source})")
 
-        st.write("Distance réseau JIRAMA...")
-        grid_km, grid_town = get_grid_distance(lat, lon)
-        res["grid_km"] = grid_km; res["grid_town"] = grid_town
-        st.write(f"Ville JIRAMA la plus proche : {grid_town} ({grid_km} km à vol d'oiseau)")
+        st.write("Distance réseau électrique (Overpass OSM)...")
+        grid_km, grid_desc, grid_source = get_grid_distance(lat, lon)
+        res["grid_km"] = grid_km
+        res["grid_desc"] = grid_desc
+        res["grid_source"] = grid_source
+        src_label = "infrastructure OSM" if grid_source == "OSM" else "ville JIRAMA (fallback)"
+        st.write(f"Infrastructure la plus proche : {grid_desc} — {grid_km} km [{src_label}]")
 
         st.write("Identification des tuiles satellitaires...")
         tokens  = get_s2_tokens(lat, lon, 4)
@@ -843,8 +909,10 @@ if res:
         ghi   = res["ghi_annual"] or 5.5
         ghim  = res["ghi_monthly"] or [None] * 12
         ghi_source = res.get("ghi_source") or "Valeur par défaut"
-        gkm   = res["grid_km"] or 0
-        gtown = res["grid_town"] or "inconnue"
+        gkm        = res["grid_km"] or 0
+        gdesc      = res.get("grid_desc") or "inconnue"
+        gsource    = res.get("grid_source") or "JIRAMA_fallback"
+        gsource_lbl = "OSM" if gsource == "OSM" else "JIRAMA fallback"
         dname = res["display_name"] or name
 
         d2    = snap.get(2.0, {})
@@ -914,16 +982,26 @@ if res:
                   help=f"Bâtiments ≥ {sme_threshold} m²")
         c3.metric("☀️ GHI annuel moyen", f"{ghi:.2f} kWh/m²/j")
         c4.metric("🔌 Distance réseau", f"{gkm} km",
-                  help=f"Ville JIRAMA la plus proche : {gtown} (distance à vol d'oiseau — pas la présence réelle du réseau)")
+                  help=f"{gdesc} · Source : {gsource_lbl} · Distance à vol d'oiseau")
         c5.metric("👥 Population estimée", f"{round(n_tot * 4.5):,}",
                   help="Bâtiments totaux × 4,5 pers./ménage (INSTAT Madagascar 2018)")
 
         # Note distance réseau
-        if gkm <= 25:
+        if gsource == "OSM":
+            osm_note = (
+                f'<div class="info-box">🗺️ <b>Infrastructure détectée (OpenStreetMap) :</b> '
+                f'<em>{gdesc}</em> à {gkm} km. '
+                f'La couverture OSM de Madagascar est partielle — une vérification terrain reste recommandée.</div>'
+            )
+            st.markdown(osm_note, unsafe_allow_html=True)
+        elif gkm <= 25:
             st.markdown(
-                f'<div class="info-box">ℹ️ <b>Distance réseau :</b> {gtown} est à {gkm} km à vol d\'oiseau, '
-                f'mais la présence réelle du réseau JIRAMA dans ce village est à vérifier sur le terrain. '
-                f'Des villages WeLight confirmés (ex. Mahavanona, 15 km d\'Antsiranana) sont dans cette configuration et restent viables.</div>',
+                f'<div class="info-box">ℹ️ <b>Distance réseau (fallback JIRAMA) :</b> '
+                f'<em>{gdesc}</em> est à {gkm} km à vol d\'oiseau. '
+                f'Aucune infrastructure électrique n\'a été trouvée dans OpenStreetMap — '
+                f'la distance à la ville JIRAMA est utilisée comme approximation. '
+                f'Des villages WeLight confirmés (ex. Mahavanona, 15 km d\'Antsiranana) '
+                f'sont dans cette configuration et restent viables.</div>',
                 unsafe_allow_html=True,
             )
 
@@ -1078,8 +1156,13 @@ if res:
 
             st.markdown("#### Contexte réseau électrique")
             gcol1, gcol2 = st.columns(2)
-            gcol1.metric("Distance réseau JIRAMA", f"{gkm} km",
-                         help=f"Ville électrifiée la plus proche : {gtown}")
+            src_badge = "🗺️ OSM" if gsource == "OSM" else "📍 JIRAMA fallback"
+            gcol1.metric(
+                "Distance réseau",
+                f"{gkm} km",
+                help=f"{gdesc} · Source : {gsource_lbl}",
+            )
+            gcol1.caption(f"Source : {src_badge} — {gdesc}")
             if gkm > 50:
                 gcol2.markdown(
                     '<div class="info-box">🟢 <b>Zone très isolée</b> — risque d\'extension du réseau '
@@ -1093,19 +1176,29 @@ if res:
                     unsafe_allow_html=True,
                 )
             else:
-                gcol2.markdown(
-                    '<div class="info-box">ℹ️ <b>Proche d\'une ville électrifiée</b> — '
-                    'mais la distance à vol d\'oiseau ne signifie pas que le réseau JIRAMA '
-                    'atteint physiquement le village. Vérification terrain requise.</div>',
-                    unsafe_allow_html=True,
-                )
+                if gsource == "OSM":
+                    gcol2.markdown(
+                        f'<div class="info-box">⚡ <b>Infrastructure électrique détectée à {gkm} km</b> '
+                        f'(<em>{gdesc}</em>, source OpenStreetMap). '
+                        f'Proximité du réseau = risque de compétition JIRAMA à surveiller. '
+                        f'Vérification terrain recommandée.</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    gcol2.markdown(
+                        '<div class="info-box">ℹ️ <b>Proche d\'une ville électrifiée (estimation)</b> — '
+                        'aucune infrastructure OSM trouvée. La distance à la ville JIRAMA est utilisée '
+                        'comme proxy. Vérification terrain requise.</div>',
+                        unsafe_allow_html=True,
+                    )
 
 # ── Pied de page ───────────────────────────────────────────────────────────────
 st.divider()
 st.markdown(
-    "<small style='color:#999'>☀️ WeLight Africa — Outil Décisionnel Solaire v2.1 &nbsp;·&nbsp; "
+    "<small style='color:#999'>☀️ WeLight Africa — Outil Décisionnel Solaire v2.2 &nbsp;·&nbsp; "
     "Google Open Buildings v3 (confiance ≥ 60%) &nbsp;·&nbsp; "
     "GHI : NASA POWER / Global Solar Atlas / PVGIS (EU JRC) &nbsp;·&nbsp; "
+    "Réseau : Overpass OSM + JIRAMA fallback &nbsp;·&nbsp; "
     "OpenStreetMap Nominatim &nbsp;·&nbsp; "
     "Calibré sur 172 villages opérés à Madagascar</small>",
     unsafe_allow_html=True,
