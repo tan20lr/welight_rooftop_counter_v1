@@ -4,11 +4,25 @@ Analyse un village malgache : toits, ressource solaire, réseau, modèle financi
 """
 
 import streamlit as st
-import requests, gzip, csv, math, os, s2sphere, folium, pandas as pd
+import requests, gzip, csv, math, os, json, s2sphere, folium, pandas as pd
 from streamlit_folium import st_folium
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 TILE_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".tile_cache")
+
+# Chargement des valeurs par défaut depuis config.json (si présent)
+_CFG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+_DEFAULTS: dict = {}
+if os.path.exists(_CFG_PATH):
+    try:
+        with open(_CFG_PATH, encoding="utf-8") as _f:
+            _DEFAULTS = json.load(_f)
+    except Exception:
+        pass
+
+def _d(key, fallback):
+    """Retourne la valeur de config.json ou le fallback hardcodé."""
+    return _DEFAULTS.get(key, fallback)
 GOB_BASE       = "https://storage.googleapis.com/open-buildings-data/v3/points_s2_level_4_gzip"
 NOMINATIM_URL  = "https://nominatim.openstreetmap.org/search"
 NASA_POWER_URL = "https://power.larc.nasa.gov/api/temporal/climatology/point"
@@ -262,17 +276,69 @@ def count_buildings_detailed(lat, lon, tile_paths, radii, sme_threshold=SME_AREA
     return result
 
 @st.cache_data(show_spinner=False)
+def parse_coordinates(text):
+    """Détecte si l'entrée est déjà des coordonnées GPS. Ex: '-13.7, 49.6' ou '-13.7103 49.6583'"""
+    import re
+    text = text.strip().replace(",", " ")
+    parts = text.split()
+    if len(parts) == 2:
+        try:
+            lat, lon = float(parts[0]), float(parts[1])
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return lat, lon
+        except ValueError:
+            pass
+    return None
+
+@st.cache_data(show_spinner=False)
 def geocode(name):
+    """
+    Cascade de géocodage :
+    1. Nominatim avec ', Madagascar'
+    2. Nominatim sans suffixe pays (pour les villages avec noms en minuscule / accentuation différente)
+    3. Résultats combinés, filtrés Madagascar en priorité
+    """
     PRIO = {"city": 0, "town": 1, "village": 2, "hamlet": 3, "suburb": 4, "locality": 5}
+    headers = {"User-Agent": "WeLight-DecisionTool/2.0"}
+    all_results = []
+
+    # Stratégie 1 : avec Madagascar
     try:
         r = requests.get(NOMINATIM_URL,
                          params={"q": f"{name}, Madagascar", "format": "json",
                                  "limit": 8, "addressdetails": 1},
-                         headers={"User-Agent": "WeLight-DecisionTool/2.0"},
-                         timeout=10)
-        results = r.json()
+                         headers=headers, timeout=10)
+        all_results.extend(r.json())
     except Exception:
-        return []
+        pass
+
+    # Stratégie 2 : sans pays (utile si le nom est ambigu ou mal accentué)
+    if not all_results:
+        try:
+            import time; time.sleep(1)
+            r = requests.get(NOMINATIM_URL,
+                             params={"q": name, "format": "json",
+                                     "limit": 10, "addressdetails": 1,
+                                     "countrycodes": "mg"},
+                             headers=headers, timeout=10)
+            all_results.extend(r.json())
+        except Exception:
+            pass
+
+    # Dédoublonnage par osm_id
+    seen = set()
+    unique = []
+    for c in all_results:
+        k = c.get("osm_id", c.get("place_id"))
+        if k not in seen:
+            seen.add(k); unique.append(c)
+
+    # Priorité Madagascar
+    mada = [c for c in unique
+            if "Madagascar" in c.get("display_name", "")
+            or c.get("address", {}).get("country_code") == "mg"]
+    results = mada or unique
+
     return sorted(results,
                   key=lambda x: (PRIO.get(x.get("type", ""), 99), x.get("place_rank", 99)))
 
@@ -543,23 +609,37 @@ def run_search(village_name, sme_threshold):
            "ghi_source": None, "grid_km": None, "grid_town": None}
 
     with st.status(f"Analyse de **{village_name}**...", expanded=True) as status:
-        st.write("Localisation via OpenStreetMap...")
-        candidates = geocode(village_name)
-        mada = ([c for c in candidates
-                 if "Madagascar" in c.get("display_name", "")
-                 or c.get("address", {}).get("country_code") == "mg"]
-                or candidates)
-        if not mada:
-            status.update(label="Village introuvable", state="error")
-            res["error"] = f"Aucun résultat pour « {village_name} » à Madagascar."
-            st.session_state["result"] = res; return
 
-        res["candidates"] = mada
-        chosen = mada[0]
-        lat, lon = float(chosen["lat"]), float(chosen["lon"])
-        res["lat"], res["lon"] = lat, lon
-        res["display_name"] = chosen.get("display_name", village_name)
-        st.write(f"Trouvé : ({lat:.4f}, {lon:.4f})")
+        # ── Détection coordonnées GPS directes ────────────────────────────────
+        coords = parse_coordinates(village_name)
+        if coords:
+            lat, lon = coords
+            res["lat"], res["lon"] = lat, lon
+            res["display_name"] = f"Coordonnées manuelles ({lat:.4f}, {lon:.4f})"
+            res["candidates"] = []
+            st.write(f"Coordonnées GPS détectées : ({lat:.4f}, {lon:.4f})")
+        else:
+            # ── Géocodage Nominatim ────────────────────────────────────────────
+            st.write("Localisation via OpenStreetMap...")
+            candidates = geocode(village_name)
+            if not candidates:
+                status.update(label="Village introuvable", state="error")
+                res["error"] = (
+                    f"« {village_name} » introuvable dans OpenStreetMap.\n\n"
+                    "**Solutions :**\n"
+                    "- Vérifiez l'orthographe (ex. *Betsiaka*, *Ambilobe*)\n"
+                    "- Cherchez le village sur [Google Maps](https://maps.google.com/?q=Madagascar) "
+                    "et **saisissez directement les coordonnées GPS** "
+                    "(ex. `-13.7103, 49.6583`)"
+                )
+                st.session_state["result"] = res; return
+
+            res["candidates"] = candidates
+            chosen = candidates[0]
+            lat, lon = float(chosen["lat"]), float(chosen["lon"])
+            res["lat"], res["lon"] = lat, lon
+            res["display_name"] = chosen.get("display_name", village_name)
+            st.write(f"Trouvé : ({lat:.4f}, {lon:.4f})")
 
         # Auto-estimate cyclone risk and store in session state
         cyclone_est = estimate_cyclone_risk(lat, lon)
@@ -631,41 +711,54 @@ with st.sidebar:
 
     st.markdown("### Clients résidentiels")
     # Sliders en valeurs entières (10–100) pour un affichage correct du %
-    pen_r = st.slider("Taux de pénétration résidentiel (%)", 10, 100, 70, 5,
+    pen_r = st.slider("Taux de pénétration résidentiel (%)", 10, 100,
+                      round(_d("penetration_rate", 0.70) * 100), 5,
                       format="%d%%",
                       help="Part des ménages abonnés. WeLight atteint ~70% en pratique.") / 100
-    tar_r = st.number_input("Tarif mensuel résidentiel (EUR)", 0.5, 20.0, 2.50, 0.10,
+    tar_r = st.number_input("Tarif mensuel résidentiel (EUR)", 0.5, 20.0,
+                             float(_d("monthly_tariff_eur", 2.50)), 0.10,
                              format="%.2f",
                              help="WeLight pratique ~2,50 EUR/mois dans le nord de Madagascar.")
-    kwh_r = st.number_input("Consommation résidentielle (kWh/jour)", 0.1, 3.0, 0.30, 0.05,
+    kwh_r = st.number_input("Consommation résidentielle (kWh/jour)", 0.1, 3.0,
+                             float(_d("consumption_per_household_kwh_day", 0.30)), 0.05,
                              format="%.2f")
 
     st.markdown("### Clients PME / Commerces")
-    pen_s = st.slider("Taux de pénétration PME (%)", 10, 100, 60, 5,
+    pen_s = st.slider("Taux de pénétration PME (%)", 10, 100,
+                      round(_d("penetration_rate_sme", 0.60) * 100), 5,
                       format="%d%%") / 100
-    tar_s = st.number_input("Tarif mensuel PME (EUR)", 1.0, 100.0, 12.00, 0.50,
+    tar_s = st.number_input("Tarif mensuel PME (EUR)", 1.0, 100.0,
+                             float(_d("monthly_tariff_sme_eur", 12.00)), 0.50,
                              format="%.2f",
                              help="Les PME paient généralement 10-15 EUR/mois pour une alimentation fiable.")
-    kwh_s = st.number_input("Consommation PME (kWh/jour)", 0.5, 20.0, 2.00, 0.25,
+    kwh_s = st.number_input("Consommation PME (kWh/jour)", 0.5, 20.0,
+                             float(_d("consumption_sme_kwh_day", 2.00)), 0.25,
                              format="%.2f")
 
     st.markdown("### Système & finance")
-    capex_kwp  = st.number_input("CAPEX par kWp (EUR)", 500, 3000, 900, 50,
+    capex_kwp  = st.number_input("CAPEX par kWp (EUR)", 500, 3000,
+                                  int(_d("capex_per_kwp_eur", 900)), 50,
                                   help="900-1 000 EUR/kWp pour un opérateur expérimenté. "
                                        "1 200+ EUR pour un premier projet.")
-    capex_batt = st.number_input("Coût batterie (EUR/kWh)", 100, 400, 200, 10,
+    capex_batt = st.number_input("Coût batterie (EUR/kWh)", 100, 400,
+                                  int(_d("battery_cost_per_kwh_eur", 200)), 10,
                                   help="LFP Afrique 2025 : EUR 180-250/kWh. "
                                        "EUR 150/kWh = optimiste, EUR 250/kWh = prudent.")
-    eff       = st.slider("Efficacité système (%)", 50, 90, 75, 1,
+    eff       = st.slider("Efficacité système (%)", 50, 90,
+                          round(_d("system_efficiency", 0.75) * 100), 1,
                           format="%d%%") / 100
-    batt_days = st.slider("Autonomie batterie (jours)", 0.5, 3.0, 1.5, 0.25)
-    opex_pct  = st.slider("OPEX de base (% du CAPEX / an)", 1, 10, 4, 1,
+    batt_days = st.slider("Autonomie batterie (jours)", 0.5, 3.0,
+                          float(_d("battery_autonomy_days", 1.5)), 0.25)
+    opex_pct  = st.slider("OPEX de base (% du CAPEX / an)", 1, 10,
+                          round(_d("opex_pct_capex", 0.04) * 100), 1,
                           format="%d%%") / 100
-    dr        = st.slider("Taux d'actualisation (%)", 5, 25, 8, 1,
+    dr        = st.slider("Taux d'actualisation (%)", 5, 25,
+                          round(_d("discount_rate", 0.08) * 100), 1,
                           format="%d%%",
                           help="8% pour financement DFI (BEI/Triodos). "
                                "12-15% pour capital commercial.") / 100
-    life      = st.number_input("Durée du projet (ans)", 5, 30, 15, 1)
+    life      = st.number_input("Durée du projet (ans)", 5, 30,
+                                int(_d("project_lifetime_years", 15)), 1)
 
     st.markdown("### Risques terrain")
 
