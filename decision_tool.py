@@ -630,9 +630,10 @@ with st.sidebar:
     )
 
     st.markdown("### Clients résidentiels")
-    pen_r = st.slider("Taux de pénétration résidentiel", 0.10, 1.0, 0.70, 0.05,
-                      format="%.0f%%",
-                      help="Part des ménages abonnés. WeLight atteint ~70% en pratique.")
+    # Sliders en valeurs entières (10–100) pour un affichage correct du %
+    pen_r = st.slider("Taux de pénétration résidentiel (%)", 10, 100, 70, 5,
+                      format="%d%%",
+                      help="Part des ménages abonnés. WeLight atteint ~70% en pratique.") / 100
     tar_r = st.number_input("Tarif mensuel résidentiel (EUR)", 0.5, 20.0, 2.50, 0.10,
                              format="%.2f",
                              help="WeLight pratique ~2,50 EUR/mois dans le nord de Madagascar.")
@@ -640,7 +641,8 @@ with st.sidebar:
                              format="%.2f")
 
     st.markdown("### Clients PME / Commerces")
-    pen_s = st.slider("Taux de pénétration PME", 0.10, 1.0, 0.60, 0.05, format="%.0f%%")
+    pen_s = st.slider("Taux de pénétration PME (%)", 10, 100, 60, 5,
+                      format="%d%%") / 100
     tar_s = st.number_input("Tarif mensuel PME (EUR)", 1.0, 100.0, 12.00, 0.50,
                              format="%.2f",
                              help="Les PME paient généralement 10-15 EUR/mois pour une alimentation fiable.")
@@ -654,13 +656,15 @@ with st.sidebar:
     capex_batt = st.number_input("Coût batterie (EUR/kWh)", 100, 400, 200, 10,
                                   help="LFP Afrique 2025 : EUR 180-250/kWh. "
                                        "EUR 150/kWh = optimiste, EUR 250/kWh = prudent.")
-    eff       = st.slider("Efficacité système", 0.50, 0.90, 0.75, 0.01, format="%.0f%%")
+    eff       = st.slider("Efficacité système (%)", 50, 90, 75, 1,
+                          format="%d%%") / 100
     batt_days = st.slider("Autonomie batterie (jours)", 0.5, 3.0, 1.5, 0.25)
-    opex_pct  = st.slider("OPEX de base (% du CAPEX / an)", 0.01, 0.10, 0.04, 0.005,
-                          format="%.1f%%")
-    dr        = st.slider("Taux d'actualisation", 0.05, 0.25, 0.08, 0.01, format="%.0f%%",
+    opex_pct  = st.slider("OPEX de base (% du CAPEX / an)", 1, 10, 4, 1,
+                          format="%d%%") / 100
+    dr        = st.slider("Taux d'actualisation (%)", 5, 25, 8, 1,
+                          format="%d%%",
                           help="8% pour financement DFI (BEI/Triodos). "
-                               "12-15% pour capital commercial.")
+                               "12-15% pour capital commercial.") / 100
     life      = st.number_input("Durée du projet (ans)", 5, 30, 15, 1)
 
     st.markdown("### Risques terrain")
