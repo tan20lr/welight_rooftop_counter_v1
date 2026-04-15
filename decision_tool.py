@@ -493,27 +493,28 @@ def get_grid_distance(lat, lon):
     Calcule la distance au réseau électrique le plus proche.
 
     Stratégie :
-    1. Interroge Overpass API (OSM) : sous-stations, pylônes et lignes HT dans 75 km.
-       → Retourne la distance réelle à l'infrastructure électrique cartographiée.
-    2. Si Overpass échoue ou ne renvoie rien : fallback sur les 12 villes JIRAMA hardcodées.
+    1. Overpass API (OSM) : sous-stations et lignes HT uniquement (rayon 50 km, max 200 résultats).
+       Timeout court (8 s) pour ne pas bloquer l'interface.
+    2. Fallback sur les 12 villes JIRAMA si Overpass échoue/est trop lent/vide.
 
     Retourne (distance_km: float, description: str, source: str).
     source = "OSM" | "JIRAMA_fallback"
     """
-    overpass_query = f"""
-[out:json][timeout:25];
-(
-  node["power"~"substation|tower|pole"](around:75000,{lat},{lon});
-  way["power"="line"](around:75000,{lat},{lon});
-);
-out center;
-"""
+    # On cherche uniquement sous-stations + lignes HT (pas les pylônes individuels → trop nombreux)
+    overpass_query = (
+        f"[out:json][timeout:8];"
+        f"("
+        f'node["power"="substation"](around:50000,{lat},{lon});'
+        f'way["power"="line"]["voltage"](around:50000,{lat},{lon});'
+        f");"
+        f"out center qt 200;"
+    )
     try:
         r = requests.post(
             OVERPASS_URL,
             data={"data": overpass_query},
             headers={"User-Agent": "WeLight-Decision-Tool/1.0"},
-            timeout=30,
+            timeout=10,   # timeout HTTP légèrement supérieur au timeout Overpass
         )
         r.raise_for_status()
         elements = r.json().get("elements", [])
@@ -523,8 +524,8 @@ out center;
             if el["type"] == "node":
                 elat, elon = el["lat"], el["lon"]
                 tags  = el.get("tags", {})
-                ptype = tags.get("power", "infrastructure")
                 pname = tags.get("name", "")
+                ptype = "sous-station"
             elif el["type"] == "way" and "center" in el:
                 elat, elon = el["center"]["lat"], el["center"]["lon"]
                 tags    = el.get("tags", {})
@@ -543,7 +544,7 @@ out center;
             return round(best_d, 1), best_desc, "OSM"
 
     except Exception:
-        pass  # réseau indisponible ou timeout → fallback
+        pass  # timeout ou erreur réseau → fallback immédiat
 
     return _jirama_fallback(lat, lon)
 
