@@ -12,6 +12,8 @@ TILE_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".tile_cache")
 GOB_BASE       = "https://storage.googleapis.com/open-buildings-data/v3/points_s2_level_4_gzip"
 NOMINATIM_URL  = "https://nominatim.openstreetmap.org/search"
 NASA_POWER_URL = "https://power.larc.nasa.gov/api/temporal/climatology/point"
+GSA_URL        = "https://api.globalsolaratlas.info/data/lta"
+PVGIS_URL      = "https://re.jrc.ec.europa.eu/api/v5_2/MRcalc"
 SNAPSHOT_RADII = [1.0, 2.0, 5.0]
 MIN_CONFIDENCE = 0.6    # Seuil validé sur terrain nord Madagascar — non modifiable
 SME_AREA_M2    = 150    # Bâtiments >= 150 m² classifiés PME/commerces
@@ -40,7 +42,7 @@ st.set_page_config(
     layout="wide",
 )
 
-for k in ("result",):
+for k in ("result", "cyclone_auto_estimate"):
     if k not in st.session_state:
         st.session_state[k] = None
 
@@ -176,7 +178,7 @@ st.markdown("""
   </div>
   <div style="margin-left:auto; text-align:right">
     <span class="wl-badge">Google Open Buildings v3</span>
-    <span class="wl-badge">NASA POWER GHI</span>
+    <span class="wl-badge">NASA POWER / GSA / PVGIS GHI</span>
     <span class="wl-badge">172 villages opérés</span>
   </div>
 </div>
@@ -274,31 +276,139 @@ def geocode(name):
     return sorted(results,
                   key=lambda x: (PRIO.get(x.get("type", ""), 99), x.get("place_rank", 99)))
 
+
+# ── GHI cascade : NASA POWER → Global Solar Atlas → PVGIS → fallback ──────────
+
+@st.cache_data(show_spinner=False)
+def get_ghi_nasa(lat, lon):
+    """NASA POWER climatology. Returns (annual, monthly_list) or raises."""
+    r = requests.get(
+        NASA_POWER_URL,
+        params={"parameters": "ALLSKY_SFC_SW_DWN", "community": "RE",
+                "longitude": lon, "latitude": lat, "format": "JSON"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    d = r.json()["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"]
+    ann = float(d.get("ANN", 0) or 0)
+    monthly = []
+    for m in range(1, 13):
+        for key in (f"{m:02d}", str(m)):
+            if key in d:
+                v = d[key]
+                monthly.append(float(v) if v not in (None, -999, "-999") else None)
+                break
+        else:
+            monthly.append(None)
+    if ann <= 0 and any(v for v in monthly if v):
+        valid = [v for v in monthly if v]
+        ann = sum(valid) / len(valid)
+    if ann <= 0:
+        raise ValueError("NASA POWER returned no valid GHI data")
+    return ann, monthly
+
+
+@st.cache_data(show_spinner=False)
+def get_ghi_gsa(lat, lon):
+    """Global Solar Atlas fallback. Returns (annual, monthly_list) or raises."""
+    r = requests.get(
+        GSA_URL,
+        params={"loc": f"{lat},{lon}"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    ann_raw = (data.get("annual", {}) or {}).get("data", {}).get("GHI")
+    if ann_raw is None:
+        raise ValueError("GSA: missing annual GHI")
+    ann = float(ann_raw)
+    monthly_raw = ((data.get("monthly", {}) or {}).get("data", {}).get("GHI")) or {}
+    monthly = []
+    for m in range(1, 13):
+        for key in (f"{m:02d}", str(m)):
+            if key in monthly_raw:
+                v = monthly_raw[key]
+                monthly.append(float(v) if v not in (None, -999) else None)
+                break
+        else:
+            monthly.append(None)
+    if ann <= 0:
+        raise ValueError("GSA returned zero GHI")
+    return ann, monthly
+
+
+@st.cache_data(show_spinner=False)
+def get_ghi_pvgis(lat, lon):
+    """PVGIS EU JRC fallback. Returns (annual, monthly_list) or raises."""
+    r = requests.get(
+        PVGIS_URL,
+        params={"lat": lat, "lon": lon, "horirrad": 1, "outputformat": "json"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    monthly_raw = data.get("outputs", {}).get("monthly", {}).get("fixed", [])
+    if not monthly_raw or len(monthly_raw) != 12:
+        raise ValueError("PVGIS: unexpected monthly data structure")
+    monthly = []
+    for item in monthly_raw:
+        v = item.get("H(h)")
+        monthly.append(float(v) if v is not None else None)
+    valid = [v for v in monthly if v]
+    if not valid:
+        raise ValueError("PVGIS: no valid monthly values")
+    ann = sum(valid) / len(valid)
+    return ann, monthly
+
+
 @st.cache_data(show_spinner=False)
 def get_ghi(lat, lon):
+    """
+    Cascade: NASA POWER → Global Solar Atlas → PVGIS → hardcoded fallback.
+    Returns (ghi_annual, ghi_monthly_list, source_name).
+    """
+    # 1. NASA POWER
     try:
-        r = requests.get(
-            NASA_POWER_URL,
-            params={"parameters": "ALLSKY_SFC_SW_DWN", "community": "RE",
-                    "longitude": lon, "latitude": lat, "format": "JSON"},
-            timeout=20,
-        )
-        d = r.json()["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"]
-        ann = float(d.get("ANN", 0) or 0)
-        monthly = []
-        for m in range(1, 13):
-            for key in (f"{m:02d}", str(m)):
-                if key in d:
-                    v = d[key]
-                    monthly.append(float(v) if v not in (None, -999, "-999") else None)
-                    break
-            else:
-                monthly.append(None)
-        if ann <= 0 and any(v for v in monthly if v):
-            ann = sum(v for v in monthly if v) / len([v for v in monthly if v])
-        return (ann if ann > 0 else 5.5), monthly
+        ann, monthly = get_ghi_nasa(lat, lon)
+        return ann, monthly, "NASA POWER climatologie"
     except Exception:
-        return 5.5, [None] * 12
+        pass
+
+    # 2. Global Solar Atlas
+    try:
+        ann, monthly = get_ghi_gsa(lat, lon)
+        return ann, monthly, "Global Solar Atlas"
+    except Exception:
+        pass
+
+    # 3. PVGIS EU JRC
+    try:
+        ann, monthly = get_ghi_pvgis(lat, lon)
+        return ann, monthly, "PVGIS (EU JRC)"
+    except Exception:
+        pass
+
+    # 4. Hardcoded fallback
+    return 5.5, [None] * 12, "Valeur par défaut"
+
+
+def estimate_cyclone_risk(lat, lon):
+    """
+    Auto-estimate cyclone risk score (0=extreme risk, 10=low risk) based on lat/lon.
+    Madagascar east coast (lon > 48 AND lat between -25 and -10): 3 (high risk)
+    North coast (lat > -14 AND lon < 49): 5
+    West coast / interior: 7
+    Default: 5
+    """
+    if lon > 48 and -25 <= lat <= -10:
+        return 3   # East coast — high cyclone risk
+    elif lat > -14 and lon < 49:
+        return 5   # North coast
+    elif lon < 46:
+        return 7   # West coast / interior
+    else:
+        return 5   # Default
+
 
 def get_grid_distance(lat, lon):
     best_d, best_name = None, None
@@ -307,6 +417,7 @@ def get_grid_distance(lat, lon):
         if best_d is None or d < best_d:
             best_d, best_name = d, tname
     return round(best_d, 1), best_name
+
 
 def compute_financials(n_res, n_sme, ghi, cfg):
     sub_r = round(n_res * cfg["pen_r"])
@@ -318,7 +429,19 @@ def compute_financials(n_res, n_sme, ghi, cfg):
     batt_kwh = daily_kwh * cfg["batt"]
     capex    = peak_kwp * cfg["cpkwp"] + batt_kwh * cfg["cpbatt"]
     ann_rev  = (sub_r * cfg["tar_r"] + sub_s * cfg["tar_s"]) * 12
-    opex     = capex * cfg["opex_p"]
+
+    # OPEX with risk supplement
+    opex_extra = 0.0
+    if cfg["stability"] < 5:
+        opex_extra += (5 - cfg["stability"]) * 0.01   # +1% per point below 5
+    if cfg["climate"] <= 3:
+        opex_extra += 0.015
+    elif cfg["climate"] <= 6:
+        opex_extra += 0.005
+    opex_base  = capex * cfg["opex_p"]
+    opex_risk  = capex * opex_extra
+    opex       = opex_base + opex_risk
+
     net_ann  = ann_rev - opex
     payback  = capex / net_ann if net_ann > 0 else 999
     npv = -capex + sum(net_ann / (1 + cfg["dr"]) ** t for t in range(1, cfg["life"] + 1))
@@ -349,26 +472,42 @@ def compute_financials(n_res, n_sme, ghi, cfg):
         "capex":    round(capex),
         "ann_rev":  round(ann_rev),
         "opex":     round(opex),
+        "opex_base": round(opex_base),
+        "opex_risk": round(opex_risk),
         "net_ann":  round(net_ann),
         "payback":  round(payback, 1),
         "npv":      round(npv),
         "irr":      round(irr * 100, 1) if irr else None,
-        "req_tar_r": round(req_tar_r, 2),
+        "req_tar_r": round(req_tar_r, 2) if req_tar_r is not None else None,
     }
 
-def priority_score(fin, ghi, grid_km):
+
+def priority_score(fin, ghi, grid_km, stability, climate):
     """
-    Score /80 pts :
-      - Finance  40 pts  (payback <= 5 = 40, <=7 = 30, <=10 = 15, >10 = 0)
-      - Solaire  20 pts  (GHI / 6.5 * 20, plafonné à 20)
-      - Réseau   20 pts  (>50 km = 20, 20-50 km = 12, 10-20 km = 6, <10 km = 0)
+    Score / 100 pts :
+      - Finance   40 pts  (payback <= 5 = 40, <=7 = 30, <=10 = 15, >10 = 0)
+      - Solaire   20 pts  (GHI / 6.5 * 20, plafonné à 20)
+      - Réseau    20 pts  (>50 km = 20, 20-50 km = 12, 10-20 km = 6, <10 km = 0)
+      - Stabilité 10 pts  (stability / 10 * 10)
+      - Climat    10 pts  (climate / 10 * 10)
       NOTE: distance à vol d'oiseau — présence réelle du réseau peut différer.
     """
     pb = fin["payback"] if fin else 999
     f  = 40 if pb <= 5 else 30 if pb <= 7 else 15 if pb <= 10 else 0
     s  = min(20, round(ghi / 6.5 * 20))
     g  = 20 if grid_km > 50 else 12 if grid_km > 20 else 6 if grid_km > 10 else 0
-    return {"total": f + s + g, "finance": f, "solaire": s, "reseau": g}
+    st_pts = min(10, round(stability / 10 * 10))
+    cl_pts = min(10, round(climate / 10 * 10))
+    total  = f + s + g + st_pts + cl_pts
+    return {
+        "total": total,
+        "finance": f,
+        "solaire": s,
+        "reseau": g,
+        "stabilite": st_pts,
+        "climat": cl_pts,
+    }
+
 
 def make_map(lat, lon, res_blds, sme_blds, radius_km, name):
     m = folium.Map(
@@ -401,7 +540,7 @@ def run_search(village_name, sme_threshold):
     res = {"village": village_name, "error": None, "snapshot": {},
            "lat": None, "lon": None, "display_name": None, "candidates": [],
            "tile_count": 0, "ghi_annual": None, "ghi_monthly": None,
-           "grid_km": None, "grid_town": None}
+           "ghi_source": None, "grid_km": None, "grid_town": None}
 
     with st.status(f"Analyse de **{village_name}**...", expanded=True) as status:
         st.write("Localisation via OpenStreetMap...")
@@ -422,10 +561,16 @@ def run_search(village_name, sme_threshold):
         res["display_name"] = chosen.get("display_name", village_name)
         st.write(f"Trouvé : ({lat:.4f}, {lon:.4f})")
 
-        st.write("Ressource solaire — NASA POWER...")
-        ghi_ann, ghi_monthly = get_ghi(lat, lon)
-        res["ghi_annual"] = ghi_ann; res["ghi_monthly"] = ghi_monthly
-        st.write(f"GHI annuel : {ghi_ann:.2f} kWh/m²/jour")
+        # Auto-estimate cyclone risk and store in session state
+        cyclone_est = estimate_cyclone_risk(lat, lon)
+        st.session_state["cyclone_auto_estimate"] = cyclone_est
+
+        st.write("Ressource solaire (cascade NASA → GSA → PVGIS)...")
+        ghi_ann, ghi_monthly, ghi_source = get_ghi(lat, lon)
+        res["ghi_annual"] = ghi_ann
+        res["ghi_monthly"] = ghi_monthly
+        res["ghi_source"] = ghi_source
+        st.write(f"GHI annuel : {ghi_ann:.2f} kWh/m²/jour (source : {ghi_source})")
 
         st.write("Distance réseau JIRAMA...")
         grid_km, grid_town = get_grid_distance(lat, lon)
@@ -511,12 +656,46 @@ with st.sidebar:
                                        "EUR 150/kWh = optimiste, EUR 250/kWh = prudent.")
     eff       = st.slider("Efficacité système", 0.50, 0.90, 0.75, 0.01, format="%.0f%%")
     batt_days = st.slider("Autonomie batterie (jours)", 0.5, 3.0, 1.5, 0.25)
-    opex_pct  = st.slider("OPEX (% du CAPEX / an)", 0.01, 0.10, 0.04, 0.005,
+    opex_pct  = st.slider("OPEX de base (% du CAPEX / an)", 0.01, 0.10, 0.04, 0.005,
                           format="%.1f%%")
     dr        = st.slider("Taux d'actualisation", 0.05, 0.25, 0.08, 0.01, format="%.0f%%",
                           help="8% pour financement DFI (BEI/Triodos). "
                                "12-15% pour capital commercial.")
     life      = st.number_input("Durée du projet (ans)", 5, 30, 15, 1)
+
+    st.markdown("### Risques terrain")
+
+    stability = st.slider(
+        "Stabilité politique / corruption", 0, 10, 4,
+        help=(
+            "0 = très instable / corruption extrême | 10 = stable / transparent. "
+            "Madagascar CPI 2023 = 26/100 (Transparency International) → valeur suggérée : 3-4"
+        ),
+    )
+    st.caption(
+        "Impact score : jusqu'à 10 pts. "
+        "Impact OPEX : +1% par point en dessous de 5 (frictions administratives)."
+    )
+
+    # Cyclone slider — default 5, but show auto-estimate info box after a search
+    climate = st.slider(
+        "Risque climatique / cyclones", 0, 10, 5,
+        help=(
+            "0 = risque extrême (cyclones fréquents, inondations) | 10 = risque faible. "
+            "La côte est malgache est très exposée aux cyclones (saison nov-avr). "
+            "Cyclone Batsirai 2022 : coûts de reconstruction +40-60% CAPEX."
+        ),
+    )
+    cyclone_est = st.session_state.get("cyclone_auto_estimate")
+    if cyclone_est is not None:
+        st.info(
+            f"Estimation automatique basée sur la localisation : **{cyclone_est}/10**. "
+            "Ajustez selon votre connaissance terrain."
+        )
+    st.caption(
+        "Impact score : jusqu'à 10 pts. "
+        "Impact OPEX : +1,5% si score ≤ 3 (cyclones fréquents), +0,5% si score 4-6."
+    )
 
     cfg = {
         "pen_r": pen_r, "pen_s": pen_s,
@@ -525,6 +704,7 @@ with st.sidebar:
         "cpkwp": capex_kwp, "cpbatt": capex_batt, "eff": eff,
         "batt":  batt_days, "opex_p": opex_pct,
         "dr": dr, "life": int(life),
+        "stability": stability, "climate": climate,
     }
 
 # ── Barre de recherche ─────────────────────────────────────────────────────────
@@ -565,6 +745,7 @@ if res:
         snap  = res["snapshot"]
         ghi   = res["ghi_annual"] or 5.5
         ghim  = res["ghi_monthly"] or [None] * 12
+        ghi_source = res.get("ghi_source") or "Valeur par défaut"
         gkm   = res["grid_km"] or 0
         gtown = res["grid_town"] or "inconnue"
         dname = res["display_name"] or name
@@ -575,7 +756,7 @@ if res:
         n_tot = d2.get("total", 0)
 
         fin   = compute_financials(n_res, n_sme, ghi, cfg)
-        sc    = priority_score(fin, ghi, gkm)
+        sc    = priority_score(fin, ghi, gkm, stability, climate)
 
         # ── Alerte coordonnées suspectes ──────────────────────────────────────
         if n_tot < 30:
@@ -590,21 +771,21 @@ if res:
         # ── Verdict ───────────────────────────────────────────────────────────
         if fin:
             pb = fin["payback"]; total_sc = sc["total"]
-            if pb <= 7 and total_sc >= 42:
+            if pb <= 7 and total_sc >= 60:
                 vcls  = "verdict-invest"
                 vicon = "✅"
                 vtit  = "INVESTIR"
-                vsub  = f"Bonne viabilité : remboursement en {pb} ans, score {total_sc}/80."
-            elif pb <= 12 and total_sc >= 27:
+                vsub  = f"Bonne viabilité : remboursement en {pb} ans, score {total_sc}/100 pts."
+            elif pb <= 12 and total_sc >= 38:
                 vcls  = "verdict-evaluate"
                 vicon = "🔶"
                 vtit  = "À ÉVALUER"
-                vsub  = f"Signaux mixtes — remboursement {pb} ans, score {total_sc}/80. Visite terrain recommandée."
+                vsub  = f"Signaux mixtes — remboursement {pb} ans, score {total_sc}/100 pts. Visite terrain recommandée."
             else:
                 vcls  = "verdict-no"
                 vicon = "❌"
                 vtit  = "NE PAS INVESTIR"
-                vsub  = f"Remboursement trop long ({pb} ans) ou score insuffisant ({total_sc}/80) avec les paramètres actuels."
+                vsub  = f"Remboursement trop long ({pb} ans) ou score insuffisant ({total_sc}/100 pts) avec les paramètres actuels."
 
             st.markdown(f"""
             <div class="{vcls}">
@@ -613,13 +794,15 @@ if res:
             </div>""", unsafe_allow_html=True)
 
             # Barre de score
-            pct = int(total_sc / 80 * 100)
+            pct = int(total_sc / 100 * 100)
             st.markdown(f"""
             <div style="font-size:.8rem;color:#888;margin-bottom:2px">
-              Score global : <b style="color:#1A1A1A">{total_sc} / 80 pts</b>
+              Score global : <b style="color:#1A1A1A">{total_sc} / 100 pts</b>
               &nbsp;·&nbsp; Finance : {sc['finance']}/40
               &nbsp;·&nbsp; Solaire : {sc['solaire']}/20
               &nbsp;·&nbsp; Réseau : {sc['reseau']}/20
+              &nbsp;·&nbsp; Stabilité : {sc['stabilite']}/10
+              &nbsp;·&nbsp; Climat : {sc['climat']}/10
             </div>
             <div class="score-bar-bg">
               <div class="score-bar-fill" style="width:{pct}%"></div>
@@ -666,6 +849,15 @@ if res:
                            delta_color="normal" if fin["npv"] > 0 else "inverse")
                 if fin["irr"]:
                     fc3.metric("TRI", f"{fin['irr']}%")
+
+                # OPEX breakdown
+                st.markdown("#### Détail OPEX annuel")
+                ox1, ox2, ox3 = st.columns(3)
+                ox1.metric("OPEX base", f"EUR {fin['opex_base']:,}",
+                           help=f"{opex_pct:.1%} du CAPEX")
+                ox2.metric("Supplément risques", f"EUR {fin['opex_risk']:,}",
+                           help="Friction politique + risque cyclonique")
+                ox3.metric("OPEX total", f"EUR {fin['opex']:,}")
 
                 st.markdown("#### Répartition abonnés")
                 sc1, sc2 = st.columns(2)
@@ -761,12 +953,12 @@ if res:
                 st.caption(
                     f"Moyenne annuelle : **{ghi:.2f}** kWh/m²/j &nbsp;·&nbsp; "
                     f"Mois min : **{min_m:.2f}** &nbsp;·&nbsp; Mois max : **{max_m:.2f}** &nbsp;·&nbsp; "
-                    f"Source : NASA POWER climatologie"
+                    f"Source : {ghi_source}"
                 )
                 # Alerte si mois le plus faible < 75% de la moyenne (sous-dimensionnement potentiel)
                 if ghi > 0 and min_m < 0.75 * ghi:
-                    kwp_avg   = round(1 / (ghi * cfg["eff"]), 3)   # kWc par kWh/jour sur moy.
-                    kwp_worst = round(1 / (min_m * cfg["eff"]), 3)  # kWc par kWh/jour sur mois min
+                    kwp_avg   = round(1 / (ghi * cfg["eff"]), 3)
+                    kwp_worst = round(1 / (min_m * cfg["eff"]), 3)
                     pct_extra = round((kwp_worst / kwp_avg - 1) * 100)
                     st.markdown(
                         f'<div class="warn-box">⚠️ <b>Risque de sous-dimensionnement :</b> '
@@ -785,6 +977,7 @@ if res:
                     )
             else:
                 st.info(f"Données mensuelles indisponibles. Moyenne annuelle utilisée : {ghi:.2f} kWh/m²/j")
+                st.caption(f"Source : {ghi_source}")
 
             st.markdown("#### Contexte réseau électrique")
             gcol1, gcol2 = st.columns(2)
@@ -813,9 +1006,9 @@ if res:
 # ── Pied de page ───────────────────────────────────────────────────────────────
 st.divider()
 st.markdown(
-    "<small style='color:#999'>☀️ WeLight Africa — Outil Décisionnel Solaire v2.0 &nbsp;·&nbsp; "
+    "<small style='color:#999'>☀️ WeLight Africa — Outil Décisionnel Solaire v2.1 &nbsp;·&nbsp; "
     "Google Open Buildings v3 (confiance ≥ 60%) &nbsp;·&nbsp; "
-    "NASA POWER GHI &nbsp;·&nbsp; "
+    "GHI : NASA POWER / Global Solar Atlas / PVGIS (EU JRC) &nbsp;·&nbsp; "
     "OpenStreetMap Nominatim &nbsp;·&nbsp; "
     "Calibré sur 172 villages opérés à Madagascar</small>",
     unsafe_allow_html=True,
