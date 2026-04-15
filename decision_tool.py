@@ -408,6 +408,12 @@ st.markdown(
 # ── Sidebar: parameters ────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Parameters")
+    st.caption(
+        "**Calibrated on WeLight's 172-village Madagascar portfolio.** "
+        "Defaults reflect WeLight's observed tariffs (~EUR 2.50/HH/month), "
+        "penetration (~70%) and CAPEX efficiency (~EUR 900/kWp at scale). "
+        "Adjust for your own context."
+    )
     st.subheader("Detection")
     min_conf      = st.selectbox("Confidence threshold", [0.0, 0.5, 0.6, 0.7, 0.8], index=2,
                                  format_func=lambda x: "All" if x == 0.0 else f">={x:.0%}",
@@ -417,27 +423,29 @@ with st.sidebar:
                                     help="Buildings >= this area are classified as commercial/SME. Madagascar rural homes average 30-60 m².")
 
     st.subheader("Residential customers")
-    pen_r   = st.slider("Penetration rate — residential", 0.10, 1.0, 0.60, 0.05,
-                        format="%.0f%%", help="% of households that subscribe")
-    tar_r   = st.number_input("Monthly tariff — residential (EUR)", 0.5, 20.0, 1.60, 0.10,
-                               format="%.2f")
+    pen_r   = st.slider("Penetration rate — residential", 0.10, 1.0, 0.70, 0.05,
+                        format="%.0f%%", help="% of households that subscribe. WeLight achieves ~70% in practice.")
+    tar_r   = st.number_input("Monthly tariff — residential (EUR)", 0.5, 20.0, 2.50, 0.10,
+                               format="%.2f", help="WeLight charges ~EUR 2.50/month in northern Madagascar.")
     kwh_r   = st.number_input("Daily consumption — residential (kWh)", 0.1, 3.0, 0.30, 0.05,
                                format="%.2f")
 
     st.subheader("Commercial / SME customers")
-    pen_s   = st.slider("Penetration rate — SME", 0.10, 1.0, 0.50, 0.05,
+    pen_s   = st.slider("Penetration rate — SME", 0.10, 1.0, 0.60, 0.05,
                         format="%.0f%%")
-    tar_s   = st.number_input("Monthly tariff — SME (EUR)", 1.0, 100.0, 8.00, 0.50,
-                               format="%.2f")
+    tar_s   = st.number_input("Monthly tariff — SME (EUR)", 1.0, 100.0, 12.00, 0.50,
+                               format="%.2f", help="Commercial customers typically pay EUR 10-15/month.")
     kwh_s   = st.number_input("Daily consumption — SME (kWh)", 0.5, 20.0, 2.00, 0.25,
                                format="%.2f")
 
     st.subheader("System & finance")
-    capex_kwp  = st.number_input("CAPEX per kWp (EUR)", 500, 3000, 1200, 50)
+    capex_kwp  = st.number_input("CAPEX per kWp (EUR)", 500, 3000, 900, 50,
+                                  help="EUR 900-1000/kWp for an experienced operator like WeLight. EUR 1200+ for first project.")
     eff        = st.slider("System efficiency", 0.50, 0.90, 0.75, 0.01, format="%.0f%%")
     batt_days  = st.slider("Battery autonomy (days)", 0.5, 3.0, 1.5, 0.25)
     opex_pct   = st.slider("OPEX (% of CAPEX / yr)", 0.01, 0.10, 0.04, 0.005, format="%.1f%%")
-    dr         = st.slider("Discount rate", 0.05, 0.25, 0.10, 0.01, format="%.0f%%")
+    dr         = st.slider("Discount rate", 0.05, 0.25, 0.08, 0.01, format="%.0f%%",
+                           help="8% for DFI-backed projects (EIB/Triodos concessional). 12-15% for commercial capital.")
     life       = st.number_input("Project lifetime (years)", 5, 30, 15, 1)
 
     cfg = {
