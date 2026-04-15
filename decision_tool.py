@@ -276,7 +276,6 @@ def count_buildings_detailed(lat, lon, tile_paths, radii, sme_threshold=SME_AREA
         }
     return result
 
-@st.cache_data(show_spinner=False)
 def parse_coordinates(text):
     """Détecte si l'entrée est déjà des coordonnées GPS. Ex: '-13.7, 49.6' ou '-13.7103 49.6583'"""
     import re
@@ -291,19 +290,19 @@ def parse_coordinates(text):
             pass
     return None
 
-@st.cache_data(show_spinner=False)
 def geocode(name):
     """
-    Cascade de géocodage :
+    Géocodage sans cache (pour éviter les résultats vides mis en cache).
+    Stratégies parallèles :
     1. Nominatim avec ', Madagascar'
-    2. Nominatim sans suffixe pays (pour les villages avec noms en minuscule / accentuation différente)
-    3. Résultats combinés, filtrés Madagascar en priorité
+    2. Nominatim countrycodes=mg  (toujours, pas seulement en fallback)
+    Résultats fusionnés, dédoublonnés, filtrés Madagascar, triés par pertinence.
     """
     PRIO = {"city": 0, "town": 1, "village": 2, "hamlet": 3, "suburb": 4, "locality": 5}
     headers = {"User-Agent": "WeLight-DecisionTool/2.0"}
     all_results = []
 
-    # Stratégie 1 : avec Madagascar
+    # Stratégie 1 : avec suffixe "Madagascar"
     try:
         r = requests.get(NOMINATIM_URL,
                          params={"q": f"{name}, Madagascar", "format": "json",
@@ -313,18 +312,16 @@ def geocode(name):
     except Exception:
         pass
 
-    # Stratégie 2 : sans pays (utile si le nom est ambigu ou mal accentué)
-    if not all_results:
-        try:
-            import time; time.sleep(1)
-            r = requests.get(NOMINATIM_URL,
-                             params={"q": name, "format": "json",
-                                     "limit": 10, "addressdetails": 1,
-                                     "countrycodes": "mg"},
-                             headers=headers, timeout=10)
-            all_results.extend(r.json())
-        except Exception:
-            pass
+    # Stratégie 2 : countrycodes=mg (toujours, complémentaire)
+    try:
+        r = requests.get(NOMINATIM_URL,
+                         params={"q": name, "format": "json",
+                                 "limit": 10, "addressdetails": 1,
+                                 "countrycodes": "mg"},
+                         headers=headers, timeout=10)
+        all_results.extend(r.json())
+    except Exception:
+        pass
 
     # Dédoublonnage par osm_id
     seen = set()
@@ -334,9 +331,10 @@ def geocode(name):
         if k not in seen:
             seen.add(k); unique.append(c)
 
-    # Priorité Madagascar
+    # Filtrage Madagascar prioritaire
     mada = [c for c in unique
             if "Madagascar" in c.get("display_name", "")
+            or "Madagasikara" in c.get("display_name", "")
             or c.get("address", {}).get("country_code") == "mg"]
     results = mada or unique
 
