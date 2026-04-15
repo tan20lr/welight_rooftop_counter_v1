@@ -163,39 +163,6 @@ st.markdown("""
     border-radius: 8px;
     padding: .65rem 1rem;
   }
-
-  /* Score bar */
-  .score-bar-bg {
-    background: #E8E8E8;
-    border-radius: 6px;
-    height: 10px;
-    margin: 4px 0 12px;
-  }
-  .score-bar-fill {
-    background: #FFC500;
-    border-radius: 6px;
-    height: 10px;
-  }
-
-  /* Info boxes */
-  .info-box {
-    background: #FFFBEA;
-    border: 1px solid #FFC500;
-    border-radius: 8px;
-    padding: .7rem 1rem;
-    font-size: .85rem;
-    color: #333;
-    margin: .5rem 0;
-  }
-  .warn-box {
-    background: #FFF3E0;
-    border: 1px solid #FB8C00;
-    border-radius: 8px;
-    padding: .7rem 1rem;
-    font-size: .85rem;
-    color: #333;
-    margin: .5rem 0;
-  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -349,7 +316,7 @@ def compute_financials(n_res, n_sme, ghi, cfg):
         return None
     peak_kwp = daily_kwh / (ghi * cfg["eff"])
     batt_kwh = daily_kwh * cfg["batt"]
-    capex    = peak_kwp * cfg["cpkwp"] + batt_kwh * 150
+    capex    = peak_kwp * cfg["cpkwp"] + batt_kwh * cfg["cpbatt"]
     ann_rev  = (sub_r * cfg["tar_r"] + sub_s * cfg["tar_s"]) * 12
     opex     = capex * cfg["opex_p"]
     net_ann  = ann_rev - opex
@@ -369,11 +336,11 @@ def compute_financials(n_res, n_sme, ghi, cfg):
             r = r2
     except Exception:
         pass
-    # Tarif min pour payback 7 ans
-    opex_sub    = opex / max(sub_r + sub_s, 1)
-    capex_sub   = capex / max(sub_r + sub_s, 1)
-    req_rev_sub = capex_sub / 7 + opex_sub
-    req_tar_r   = req_rev_sub / 12
+    # Tarif résidentiel minimum pour payback 7 ans
+    # Revenus annuels PME déjà acquis déduits — on cherche uniquement le complément résidentiel
+    sme_ann_rev  = sub_s * cfg["tar_s"] * 12
+    rev_needed   = max(0.0, capex / 7 + opex - sme_ann_rev)
+    req_tar_r    = rev_needed / (sub_r * 12) if sub_r > 0 else None
 
     return {
         "sub_r": sub_r, "sub_s": sub_s,
@@ -536,9 +503,12 @@ with st.sidebar:
                              format="%.2f")
 
     st.markdown("### Système & finance")
-    capex_kwp = st.number_input("CAPEX par kWp (EUR)", 500, 3000, 900, 50,
-                                 help="900-1 000 EUR/kWp pour un opérateur expérimenté. "
-                                      "1 200+ EUR pour un premier projet.")
+    capex_kwp  = st.number_input("CAPEX par kWp (EUR)", 500, 3000, 900, 50,
+                                  help="900-1 000 EUR/kWp pour un opérateur expérimenté. "
+                                       "1 200+ EUR pour un premier projet.")
+    capex_batt = st.number_input("Coût batterie (EUR/kWh)", 100, 400, 200, 10,
+                                  help="LFP Afrique 2025 : EUR 180-250/kWh. "
+                                       "EUR 150/kWh = optimiste, EUR 250/kWh = prudent.")
     eff       = st.slider("Efficacité système", 0.50, 0.90, 0.75, 0.01, format="%.0f%%")
     batt_days = st.slider("Autonomie batterie (jours)", 0.5, 3.0, 1.5, 0.25)
     opex_pct  = st.slider("OPEX (% du CAPEX / an)", 0.01, 0.10, 0.04, 0.005,
@@ -552,7 +522,7 @@ with st.sidebar:
         "pen_r": pen_r, "pen_s": pen_s,
         "tar_r": tar_r, "tar_s": tar_s,
         "kwh_r": kwh_r, "kwh_s": kwh_s,
-        "cpkwp": capex_kwp, "eff": eff,
+        "cpkwp": capex_kwp, "cpbatt": capex_batt, "eff": eff,
         "batt":  batt_days, "opex_p": opex_pct,
         "dr": dr, "life": int(life),
     }
@@ -608,7 +578,7 @@ if res:
         sc    = priority_score(fin, ghi, gkm)
 
         # ── Alerte coordonnées suspectes ──────────────────────────────────────
-        if n2 < 30 if (n2 := n_tot) else False:
+        if n_tot < 30:
             if any(t in dname.lower() for t in ["district", "province", "region", "diana", "sava", "sofia"]):
                 st.markdown(
                     f'<div class="warn-box">⚠️ Les coordonnées semblent pointer sur une limite administrative, '
@@ -665,8 +635,8 @@ if res:
         c3.metric("☀️ GHI annuel moyen", f"{ghi:.2f} kWh/m²/j")
         c4.metric("🔌 Distance réseau", f"{gkm} km",
                   help=f"Ville JIRAMA la plus proche : {gtown} (distance à vol d'oiseau — pas la présence réelle du réseau)")
-        c5.metric("👥 Population estimée", f"{n_tot * 4:,}",
-                  help="Bâtiments totaux × 4 pers./ménage")
+        c5.metric("👥 Population estimée", f"{round(n_tot * 4.5):,}",
+                  help="Bâtiments totaux × 4,5 pers./ménage (INSTAT Madagascar 2018)")
 
         # Note distance réseau
         if gkm <= 25:
@@ -692,7 +662,7 @@ if res:
                 fc3.metric("Remboursement", f"{fin['payback']} ans",
                            delta="OK" if fin["payback"] <= 7 else "Trop long",
                            delta_color="normal" if fin["payback"] <= 7 else "inverse")
-                fc3.metric("VAN (15 ans)", f"EUR {fin['npv']:,}",
+                fc3.metric(f"VAN ({life} ans)", f"EUR {fin['npv']:,}",
                            delta_color="normal" if fin["npv"] > 0 else "inverse")
                 if fin["irr"]:
                     fc3.metric("TRI", f"{fin['irr']}%")
@@ -713,9 +683,14 @@ if res:
                         f"(EUR {rev_sme:,.0f}/an) vs résidentiel EUR {rev_res:,.0f}/an"
                     )
 
-                # Tarif min
+                # Tarif résidentiel minimum (net des revenus PME)
                 req = fin["req_tar_r"]
-                if req > tar_r:
+                if req is None:
+                    st.markdown(
+                        '<div class="info-box">ℹ️ Aucun abonné résidentiel — les revenus PME seuls ne permettent pas de calculer un tarif résidentiel minimum.</div>',
+                        unsafe_allow_html=True,
+                    )
+                elif req > tar_r:
                     st.markdown(
                         f'<div class="warn-box">⚠️ Pour un remboursement en 7 ans, le tarif résidentiel '
                         f'doit atteindre <b>EUR {req:.2f}/mois</b> (actuellement EUR {tar_r:.2f}). '
@@ -724,13 +699,14 @@ if res:
                     )
                 else:
                     st.markdown(
-                        f'<div class="info-box">✅ Le tarif actuel (EUR {tar_r:.2f}) est supérieur au minimum '
-                        f'requis (EUR {req:.2f}) pour un remboursement en 7 ans.</div>',
+                        f'<div class="info-box">✅ Le tarif actuel (EUR {tar_r:.2f}/mois) est supérieur au minimum '
+                        f'requis (EUR {req:.2f}/mois, déduction faite des revenus PME) '
+                        f'pour un remboursement en 7 ans.</div>',
                         unsafe_allow_html=True,
                     )
 
                 # Cashflow cumulé
-                st.markdown("#### Flux de trésorerie cumulé (15 ans)")
+                st.markdown(f"#### Flux de trésorerie cumulé ({life} ans)")
                 ann_net = fin["net_ann"]
                 cf  = [-fin["capex"]] + [ann_net] * int(life)
                 cum = []; s = 0
@@ -766,7 +742,7 @@ if res:
                     "Total": d.get("total", 0),
                     "Résidentiels": d.get("residential", 0),
                     "PME / Commerces": d.get("sme", 0),
-                    "Pop. estimée": d.get("total", 0) * 4,
+                    "Pop. estimée": round(d.get("total", 0) * 4.5),
                 })
             st.dataframe(pd.DataFrame(rows).set_index("Rayon"), use_container_width=True)
 
@@ -787,11 +763,24 @@ if res:
                     f"Mois min : **{min_m:.2f}** &nbsp;·&nbsp; Mois max : **{max_m:.2f}** &nbsp;·&nbsp; "
                     f"Source : NASA POWER climatologie"
                 )
-                if min_m < 4.0:
+                # Alerte si mois le plus faible < 75% de la moyenne (sous-dimensionnement potentiel)
+                if ghi > 0 and min_m < 0.75 * ghi:
+                    kwp_avg   = round(1 / (ghi * cfg["eff"]), 3)   # kWc par kWh/jour sur moy.
+                    kwp_worst = round(1 / (min_m * cfg["eff"]), 3)  # kWc par kWh/jour sur mois min
+                    pct_extra = round((kwp_worst / kwp_avg - 1) * 100)
                     st.markdown(
-                        f'<div class="warn-box">⚠️ Mois à faible ensoleillement détectés '
-                        f'({min_m:.2f} kWh/m²/j). Augmentez l\'autonomie batterie pour une '
-                        f'alimentation fiable toute l\'année.</div>',
+                        f'<div class="warn-box">⚠️ <b>Risque de sous-dimensionnement :</b> '
+                        f'le mois le plus faible ({min_m:.2f} kWh/m²/j) représente '
+                        f'{min_m/ghi*100:.0f}% de la moyenne annuelle. '
+                        f'Un système dimensionné sur la moyenne annuelle sera déficitaire '
+                        f'en saison défavorable ({pct_extra}% de puissance manquante). '
+                        f'Augmentez l\'autonomie batterie ou la puissance crête en conséquence.</div>',
+                        unsafe_allow_html=True,
+                    )
+                elif min_m < 4.0:
+                    st.markdown(
+                        f'<div class="warn-box">⚠️ Mois à faible ensoleillement ({min_m:.2f} kWh/m²/j). '
+                        f'Augmentez l\'autonomie batterie pour une alimentation fiable toute l\'année.</div>',
                         unsafe_allow_html=True,
                     )
             else:
